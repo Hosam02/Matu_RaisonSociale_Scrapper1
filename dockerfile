@@ -1,7 +1,8 @@
 # -----------------------------
-# Base image with Node 20
+# Base image with Node 24
 # -----------------------------
 FROM node:24-bullseye
+
 # -----------------------------
 # Install dependencies required by Playwright / Chromium
 # -----------------------------
@@ -14,6 +15,7 @@ RUN apt-get update && apt-get install -y \
     libatk1.0-0 \
     libcups2 \
     libdrm2 \
+    libgbm1 \
     libgtk-3-0 \
     libnspr4 \
     libnss3 \
@@ -43,9 +45,9 @@ RUN npm install
 COPY . .
 
 # -----------------------------
-# Install Playwright browsers
+# Install Playwright browsers (Chromium only to save time/space)
 # -----------------------------
-RUN npx playwright install --with-deps
+RUN npx playwright install chromium
 
 # -----------------------------
 # Set environment variables
@@ -53,6 +55,13 @@ RUN npx playwright install --with-deps
 ENV PORT=3005
 ENV CHARIKA_USERNAME=H.QOTBI@matu.ma
 ENV CHARIKA_PASSWORD=Houssam@2002
+ENV DB_HOST=192.168.80.61
+ENV DB_PORT=1433
+ENV DB_USER=ss_appsmatu
+ENV DB_PASSWORD=@pmatu$ql84
+ENV DB_NAME=Corps25
+ENV DB_ENCRYPT=false
+ENV DB_TRUST_CERT=true
 
 # -----------------------------
 # Expose the API port
