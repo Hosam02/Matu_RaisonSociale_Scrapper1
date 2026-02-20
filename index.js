@@ -660,6 +660,32 @@ app.get("/api/health", (req, res) => {
   });
 });
 
+/* =======================
+   LOGOUT ENDPOINT
+======================= */
+app.post("/api/logout", async (req, res) => {
+  console.log("👋 Logout endpoint called");
+  
+  if (browser) {
+    await browser.close().catch(() => {});
+    browser = null;
+    page = null;
+  }
+  
+  loginStatus = {
+    isLoggedIn: false,
+    lastLoginAttempt: null,
+    error: null,
+    sessionAge: null
+  };
+  
+  res.json({ 
+    success: true, 
+    message: "Logged out successfully" 
+  });
+});
+
+
 app.post("/api/ice", async (req, res) => {
   const ice = (req.body?.ice || "").trim();
 
