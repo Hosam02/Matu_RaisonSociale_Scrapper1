@@ -450,7 +450,7 @@ async function refreshSession() {
 }
 
 /* =======================
-   SEARCH ENDPOINT
+   SEARCH ENDPOINT - UPDATED
 ======================= */
 app.post("/api/search", async (req, res) => {
   const { name, city } = req.body;
@@ -543,89 +543,121 @@ async function performSearch(companyName, city) {
   if (results.length === 0) {
     return {
       InputRaisonSociale: companyName,
-      Status: "Not Found"
+      Status: "Not Found",
+      Recommendations: []
     };
   }
   
   const companyClean = cleanName(companyName);
-  let bestMatch = { index: -1, score: 0, name: '', href: '' };
+  const scoredResults = [];
   
+  // Calculate scores for all results
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
     const cleanedResult = cleanName(result.name);
     const score = similarity(companyClean, cleanedResult);
     
-    if (score === 1 && (!normalizedCity || normalizeString(result.address).includes(normalizedCity))) {
-      bestMatch = { index: i, score: 1, name: result.name, href: result.href };
-      break;
-    }
+    // Check if city matches (if city filter is provided)
+    const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
     
-    if (score > bestMatch.score) {
-      bestMatch = { index: i, score, name: result.name, href: result.href };
-    }
+    scoredResults.push({
+      index: i,
+      name: result.name,
+      href: result.href,
+      address: result.address,
+      score: score,
+      cityMatches: cityMatches,
+      combinedScore: cityMatches ? score * 1.2 : score // Boost score if city matches
+    });
   }
   
-  if (bestMatch.score < 0.8 || bestMatch.index === -1) {
-    return {
-      InputRaisonSociale: companyName,
-      Status: "Not Found",
-      MatchScore: bestMatch.score
-    };
-  }
+  // Sort by combined score (highest first)
+  scoredResults.sort((a, b) => b.combinedScore - a.combinedScore);
   
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5000 }),
-    page.goto(`https://www.charika.ma/${bestMatch.href}`)
-  ]);
+  // Check if we have an exact match (score >= 0.95)
+  const exactMatch = scoredResults.find(r => r.score >= 0.95 && (!normalizedCity || r.cityMatches));
   
-  const info = await page.evaluate(({ companyName, foundName, bestScore }) => {
-    const result = {
-      InputRaisonSociale: companyName,
-      FoundRaisonSociale: foundName,
-      Status: "Found",
-      MatchScore: bestScore
-    };
+  if (exactMatch) {
+    // Navigate to the exact match and get detailed info
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5000 }),
+      page.goto(`https://www.charika.ma/${exactMatch.href}`)
+    ]);
     
-    const table = document.querySelector('div.col-md-7 table.informations-entreprise');
-    if (table) {
-      const rows = table.querySelectorAll('tbody tr');
-      rows.forEach(row => {
-        const cells = row.querySelectorAll('td');
-        if (cells.length >= 2) {
-          const field = cells[0].innerText.trim();
-          const value = cells[1].innerText.trim();
-          
-          if (field.includes('RC') || field.includes('Registre')) {
-            const match = value.match(/^(\d+)\s*\((.+)\)$/);
-            result.RCNumber = match ? match[1] : value;
-            result.RCTribunal = match ? match[2] : null;
-          } else if (field.includes('ICE')) result.ICE = value;
-          else if (field.includes('Forme juridique')) result.FormeJuridique = value;
-          else if (field.includes('Capital')) result.Capital = value;
-          else result[field] = value;
-        }
-      });
+    const info = await page.evaluate(({ companyName, foundName, bestScore }) => {
+      const result = {
+        InputRaisonSociale: companyName,
+        FoundRaisonSociale: foundName,
+        Status: "Found",
+        MatchScore: bestScore,
+        IsExactMatch: true
+      };
+      
+      const table = document.querySelector('div.col-md-7 table.informations-entreprise');
+      if (table) {
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach(row => {
+          const cells = row.querySelectorAll('td');
+          if (cells.length >= 2) {
+            const field = cells[0].innerText.trim();
+            const value = cells[1].innerText.trim();
+            
+            if (field.includes('RC') || field.includes('Registre')) {
+              const match = value.match(/^(\d+)\s*\((.+)\)$/);
+              result.RCNumber = match ? match[1] : value;
+              result.RCTribunal = match ? match[2] : null;
+            } else if (field.includes('ICE')) result.ICE = value;
+            else if (field.includes('Forme juridique')) result.FormeJuridique = value;
+            else if (field.includes('Capital')) result.Capital = value;
+            else result[field] = value;
+          }
+        });
+      }
+      
+      const addressLabels = Array.from(document.querySelectorAll(
+        'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
+      )).map(l => l.innerText.trim());
+      if (addressLabels.length) {
+        result.Address = addressLabels.join(' ');
+      }
+      
+      return result;
+    }, { 
+      companyName, 
+      foundName: exactMatch.name, 
+      bestScore: exactMatch.score 
+    });
+    
+    if (normalizedCity && info.Address) {
+      info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
     }
     
-    const addressLabels = Array.from(document.querySelectorAll(
-      'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
-    )).map(l => l.innerText.trim());
-    if (addressLabels.length) {
-      result.Address = addressLabels.join(' ');
-    }
-    
-    return result;
-  }, { 
-    companyName, 
-    foundName: bestMatch.name, 
-    bestScore: bestMatch.score 
-  });
+    return info;
+  } 
   
-  if (normalizedCity && info.Address) {
-    info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
+  // No exact match found - return top 3 recommendations
+  const topResults = scoredResults.slice(0, 3);
+  const recommendations = [];
+  
+  // Get basic info for top results (without navigating to each detail page)
+  for (const result of topResults) {
+    recommendations.push({
+      name: result.name,
+      address: result.address,
+      matchScore: result.score,
+      cityMatches: result.cityMatches,
+      url: `https://www.charika.ma/${result.href}`,
+      // We could navigate to each detail page here if needed, but that would be slow
+      // For now, we just return the basic info from search results
+    });
   }
   
-  return info;
+  return {
+    InputRaisonSociale: companyName,
+    Status: "Not Found - Showing Recommendations",
+    Message: "Exact match not found. Showing top 3 closest matches.",
+    Recommendations: recommendations
+  };
 }
 
 /* =======================
