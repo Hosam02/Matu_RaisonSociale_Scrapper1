@@ -55,6 +55,84 @@ function parseRC(rcText) {
   };
 }
 
+// Function to extract company details from a page
+async function extractCompanyDetails(page, url) {
+  try {
+    await page.goto(url, { 
+      waitUntil: "domcontentloaded",
+      timeout: 8000 
+    });
+    
+    const details = await page.evaluate(() => {
+      const result = {};
+      
+      // Get company name from the title or heading
+      const titleElement = document.querySelector('h1');
+      if (titleElement) {
+        result.NomCommercial = titleElement.innerText.trim();
+      }
+      
+      // Extract from information table
+      const table = document.querySelector('div.col-md-7 table.informations-entreprise');
+      if (table) {
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach(row => {
+          const cells = row.querySelectorAll('td');
+          if (cells.length >= 2) {
+            const field = cells[0].innerText.trim();
+            const value = cells[1].innerText.trim();
+            
+            if (field.includes('RC') || field.includes('Registre')) {
+              const match = value.match(/^(\d+)\s*\((.+)\)$/);
+              result.RCNumber = match ? match[1] : value;
+              result.RCTribunal = match ? match[2] : null;
+            } else if (field.includes('ICE')) {
+              result.ICE = value;
+            } else if (field.includes('Forme juridique')) {
+              result.FormeJuridique = value;
+            } else if (field.includes('Capital')) {
+              result.Capital = value;
+            } else if (field.includes('Activité')) {
+              result.Activite = value;
+            } else if (field.includes('Adresse')) {
+              result.Adresse = value;
+            } else if (field.includes('Tél')) {
+              result.Telephone = value;
+            } else if (field.includes('Fax')) {
+              result.Fax = value;
+            } else if (field.includes('Email')) {
+              result.Email = value;
+            } else if (field.includes('Site web')) {
+              result.SiteWeb = value;
+            } else {
+              // Store other fields dynamically
+              const key = field.replace(/[^a-zA-Z0-9]/g, '');
+              result[key] = value;
+            }
+          }
+        });
+      }
+      
+      // Try to get address from alternative location
+      if (!result.Adresse) {
+        const addressLabels = Array.from(document.querySelectorAll(
+          'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
+        )).map(l => l.innerText.trim());
+        if (addressLabels.length) {
+          result.Adresse = addressLabels.join(' ');
+        }
+      }
+      
+      return result;
+    });
+    
+    return details;
+  } catch (error) {
+    console.error(`Error extracting details from ${url}:`, error.message);
+    return { error: "Failed to extract company details" };
+  }
+}
+
 /* =======================
    BROWSER MANAGER
 ======================= */
@@ -70,7 +148,7 @@ let loginStatus = {
 };
 
 // Track connected WebSocket clients with metadata
-const wsClients = new Map(); // Use Map to store client info
+const wsClients = new Map();
 
 // Track browser usage
 let lastUsed = Date.now();
@@ -81,9 +159,7 @@ const SESSION_REFRESH_INTERVAL = 25 * 60 * 1000; // Refresh session every 25 min
    WEBSOCKET STATUS BROADCAST
 ======================= */
 
-// Broadcast status to all connected WebSocket clients
 function broadcastStatus(update = {}) {
-  // Update session age if logged in
   if (loginStatus.isLoggedIn && loginStatus.lastLoginAttempt) {
     const now = Date.now();
     const lastLogin = new Date(loginStatus.lastLoginAttempt).getTime();
@@ -102,22 +178,20 @@ function broadcastStatus(update = {}) {
   const message = JSON.stringify(statusUpdate);
   
   wsClients.forEach((clientInfo, client) => {
-    if (client.readyState === 1) { // WebSocket.OPEN
+    if (client.readyState === 1) {
       client.send(message);
-    } else if (client.readyState === 3) { // CLOSED
+    } else if (client.readyState === 3) {
       wsClients.delete(client);
     }
   });
 }
 
-// Update login status and broadcast
 function updateLoginStatus(updates) {
   loginStatus = {
     ...loginStatus,
     ...updates,
     lastUpdated: new Date().toISOString()
   };
-  
   broadcastStatus();
 }
 
@@ -131,16 +205,13 @@ wss.on('connection', (ws, req) => {
   
   console.log(`🔌 New WebSocket client connected: ${clientId} from ${clientIp}`);
   
-  // Store client with metadata
   wsClients.set(ws, {
     id: clientId,
     ip: clientIp,
     connectedAt: new Date().toISOString(),
-    lastPing: Date.now(),
-    reconnectCount: 0
+    lastPing: Date.now()
   });
   
-  // Send initial status immediately
   ws.send(JSON.stringify({
     type: 'welcome',
     clientId: clientId,
@@ -150,12 +221,10 @@ wss.on('connection', (ws, req) => {
   
   broadcastStatus();
   
-  // Handle client messages
   ws.on('message', async (message) => {
     try {
       const data = JSON.parse(message.toString());
       
-      // Update last ping time
       const clientInfo = wsClients.get(ws);
       if (clientInfo) {
         clientInfo.lastPing = Date.now();
@@ -164,19 +233,11 @@ wss.on('connection', (ws, req) => {
       
       switch(data.type) {
         case 'ping':
-          ws.send(JSON.stringify({ 
-            type: 'pong', 
-            timestamp: Date.now() 
-          }));
+          ws.send(JSON.stringify({ type: 'pong', timestamp: Date.now() }));
           break;
-          
         case 'get_status':
-          ws.send(JSON.stringify({
-            type: 'status',
-            data: loginStatus
-          }));
+          ws.send(JSON.stringify({ type: 'status', data: loginStatus }));
           break;
-          
         case 'request_login':
           ws.send(JSON.stringify({ 
             type: 'login_started', 
@@ -184,39 +245,26 @@ wss.on('connection', (ws, req) => {
             timestamp: new Date().toISOString()
           }));
           
-          // Trigger login asynchronously
           initializeBrowserAndLogin().catch(error => {
             console.error('Login error:', error);
-            updateLoginStatus({ 
-              status: 'error', 
-              error: error.message 
-            });
+            updateLoginStatus({ status: 'error', error: error.message });
           });
           break;
-          
         default:
-          ws.send(JSON.stringify({ 
-            type: 'error', 
-            message: 'Unknown command' 
-          }));
+          ws.send(JSON.stringify({ type: 'error', message: 'Unknown command' }));
       }
     } catch (error) {
       console.error('WebSocket message error:', error);
-      ws.send(JSON.stringify({ 
-        type: 'error', 
-        message: 'Invalid message format' 
-      }));
+      ws.send(JSON.stringify({ type: 'error', message: 'Invalid message format' }));
     }
   });
 
-  // Handle disconnection
   ws.on('close', (code, reason) => {
     const clientInfo = wsClients.get(ws);
     console.log(`🔌 WebSocket client disconnected: ${clientInfo?.id || 'unknown'} (Code: ${code}, Reason: ${reason})`);
     wsClients.delete(ws);
   });
 
-  // Handle errors
   ws.on('error', (error) => {
     const clientInfo = wsClients.get(ws);
     console.error(`WebSocket client error for ${clientInfo?.id || 'unknown'}:`, error);
@@ -224,17 +272,16 @@ wss.on('connection', (ws, req) => {
   });
 });
 
-// Ping all clients periodically to detect stale connections
+// Ping all clients periodically
 setInterval(() => {
   const now = Date.now();
   wsClients.forEach((clientInfo, client) => {
-    if (client.readyState === 1) { // OPEN
-      // Check if client hasn't pinged in last 30 seconds
+    if (client.readyState === 1) {
       if (now - clientInfo.lastPing > 30000) {
         console.log(`Client ${clientInfo.id} inactive, sending ping...`);
         client.send(JSON.stringify({ type: 'ping' }));
       }
-    } else if (client.readyState === 3) { // CLOSED
+    } else if (client.readyState === 3) {
       wsClients.delete(client);
     }
   });
@@ -251,11 +298,7 @@ app.post("/api/login", async (req, res) => {
   console.log("🔑 Login endpoint called");
   
   try {
-    updateLoginStatus({ 
-      status: 'connecting', 
-      error: null 
-    });
-    
+    updateLoginStatus({ status: 'connecting', error: null });
     const result = await initializeBrowserAndLogin();
     res.json(result);
   } catch (error) {
@@ -363,7 +406,7 @@ async function performLogin() {
 
 async function verifyLogin() {
   try {
-    const loggedInIndicator = await page.locator('.user-connected, a.UserConnect-login').first().isVisible()
+    await page.locator('.user-connected, a.UserConnect-login').first().isVisible()
       .catch(() => false);
     
     await page.goto("https://www.charika.ma/accueil", { 
@@ -440,17 +483,13 @@ async function refreshSession() {
     
   } catch (error) {
     console.error("Session refresh failed:", error);
-    updateLoginStatus({ 
-      isLoggedIn: false, 
-      status: 'error',
-      error: error.message 
-    });
+    updateLoginStatus({ isLoggedIn: false, status: 'error', error: error.message });
     return false;
   }
 }
 
 /* =======================
-   SEARCH ENDPOINT - UPDATED
+   SEARCH ENDPOINT - WITH TOP 3 RECOMMENDATIONS
 ======================= */
 app.post("/api/search", async (req, res) => {
   const { name, city } = req.body;
@@ -507,11 +546,13 @@ app.post("/api/search", async (req, res) => {
 async function performSearch(companyName, city) {
   const normalizedCity = city ? normalizeString(city) : null;
   
+  // Navigate to home page
   await page.goto("https://www.charika.ma/accueil", { 
     waitUntil: "domcontentloaded",
     timeout: 8000
   });
   
+  // Find and fill search input
   const searchInput = await page.waitForSelector(
     'input.rq-form-element[name="sDenomination"]:visible, ' +
     'input[placeholder*="raison sociale"]:visible', 
@@ -525,6 +566,7 @@ async function performSearch(companyName, city) {
     searchInput.press("Enter")
   ]);
   
+  // Extract search results
   const results = await page.$$eval('div.text-soc', (items) => {
     return items.map(item => {
       const link = item.querySelector('h5 a');
@@ -544,53 +586,48 @@ async function performSearch(companyName, city) {
     return {
       InputRaisonSociale: companyName,
       Status: "Not Found",
-      Recommendations: []
+      Message: "No results found for your search query."
     };
   }
   
+  // Find best match (for scoring purposes)
   const companyClean = cleanName(companyName);
-  const scoredResults = [];
+  let bestMatch = { index: -1, score: 0, name: '', href: '' };
   
-  // Calculate scores for all results
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
     const cleanedResult = cleanName(result.name);
     const score = similarity(companyClean, cleanedResult);
-    
-    // Check if city matches (if city filter is provided)
     const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
     
-    scoredResults.push({
-      index: i,
-      name: result.name,
-      href: result.href,
-      address: result.address,
-      score: score,
-      cityMatches: cityMatches,
-      combinedScore: cityMatches ? score * 1.2 : score // Boost score if city matches
-    });
+    // Check for exact match with city filter
+    if (score === 1 && (!normalizedCity || cityMatches)) {
+      bestMatch = { index: i, score: 1, name: result.name, href: result.href };
+      break;
+    }
+    
+    // Track best score
+    if (score > bestMatch.score) {
+      bestMatch = { index: i, score, name: result.name, href: result.href };
+    }
   }
   
-  // Sort by combined score (highest first)
-  scoredResults.sort((a, b) => b.combinedScore - a.combinedScore);
-  
-  // Check if we have an exact match (score >= 0.95)
-  const exactMatch = scoredResults.find(r => r.score >= 0.95 && (!normalizedCity || r.cityMatches));
-  
-  if (exactMatch) {
-    // Navigate to the exact match and get detailed info
+  // If we have a good match (score >= 0.8), return that company's details
+  if (bestMatch.score >= 0.8 && bestMatch.index !== -1) {
+    // Navigate to the best match's page
     await Promise.all([
       page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5000 }),
-      page.goto(`https://www.charika.ma/${exactMatch.href}`)
+      page.goto(`https://www.charika.ma/${bestMatch.href}`)
     ]);
     
+    // Extract company details
     const info = await page.evaluate(({ companyName, foundName, bestScore }) => {
       const result = {
         InputRaisonSociale: companyName,
         FoundRaisonSociale: foundName,
         Status: "Found",
         MatchScore: bestScore,
-        IsExactMatch: true
+        IsExactMatch: bestScore >= 0.95
       };
       
       const table = document.querySelector('div.col-md-7 table.informations-entreprise');
@@ -624,8 +661,8 @@ async function performSearch(companyName, city) {
       return result;
     }, { 
       companyName, 
-      foundName: exactMatch.name, 
-      bestScore: exactMatch.score 
+      foundName: bestMatch.name, 
+      bestScore: bestMatch.score 
     });
     
     if (normalizedCity && info.Address) {
@@ -633,33 +670,132 @@ async function performSearch(companyName, city) {
     }
     
     return info;
-  } 
+  }
   
-  // No exact match found - return top 3 recommendations
-  const topResults = scoredResults.slice(0, 3);
+  // No good match found - return top 3 search results with detailed info
+  const topResults = results.slice(0, 3); // Take first 3 results as they appear on Charika
   const recommendations = [];
   
-  // Get basic info for top results (without navigating to each detail page)
+  // Get detailed info for each top result
   for (const result of topResults) {
-    recommendations.push({
-      name: result.name,
-      address: result.address,
-      matchScore: result.score,
-      cityMatches: result.cityMatches,
-      url: `https://www.charika.ma/${result.href}`,
-      // We could navigate to each detail page here if needed, but that would be slow
-      // For now, we just return the basic info from search results
+    console.log(`🔍 Fetching details for: ${result.name}`);
+    
+    // Navigate to the company page
+    await page.goto(`https://www.charika.ma/${result.href}`, { 
+      waitUntil: "domcontentloaded",
+      timeout: 8000 
     });
+    
+    // Extract detailed information
+    const details = await page.evaluate(() => {
+      const result = {};
+      
+      // Get company name from the title or heading
+      const titleElement = document.querySelector('h1');
+      if (titleElement) {
+        result.NomCommercial = titleElement.innerText.trim();
+      }
+      
+      // Extract from information table
+      const table = document.querySelector('div.col-md-7 table.informations-entreprise');
+      if (table) {
+        const rows = table.querySelectorAll('tbody tr');
+        rows.forEach(row => {
+          const cells = row.querySelectorAll('td');
+          if (cells.length >= 2) {
+            const field = cells[0].innerText.trim();
+            const value = cells[1].innerText.trim();
+            
+            if (field.includes('RC') || field.includes('Registre')) {
+              const match = value.match(/^(\d+)\s*\((.+)\)$/);
+              result.RCNumber = match ? match[1] : value;
+              result.RCTribunal = match ? match[2] : null;
+            } else if (field.includes('ICE')) {
+              result.ICE = value;
+            } else if (field.includes('Forme juridique')) {
+              result.FormeJuridique = value;
+            } else if (field.includes('Capital')) {
+              result.Capital = value;
+            } else if (field.includes('Activité')) {
+              result.Activite = value;
+            } else if (field.includes('Adresse')) {
+              result.Adresse = value;
+            } else if (field.includes('Tél')) {
+              result.Telephone = value;
+            } else if (field.includes('Fax')) {
+              result.Fax = value;
+            } else if (field.includes('Email')) {
+              result.Email = value;
+            } else if (field.includes('Site web')) {
+              result.SiteWeb = value;
+            } else {
+              // Store other fields dynamically
+              const key = field.replace(/[^a-zA-Z0-9]/g, '');
+              result[key] = value;
+            }
+          }
+        });
+      }
+      
+      // Try to get address from alternative location
+      if (!result.Adresse) {
+        const addressLabels = Array.from(document.querySelectorAll(
+          'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
+        )).map(l => l.innerText.trim());
+        if (addressLabels.length) {
+          result.Adresse = addressLabels.join(' ');
+        }
+      }
+      
+      return result;
+    });
+    
+    // Calculate match score for informational purposes
+    const score = similarity(companyName, result.name);
+    const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
+    
+    recommendations.push({
+      // Basic info
+      name: result.name,
+      url: `https://www.charika.ma/${result.href}`,
+      position: results.indexOf(result) + 1,
+      
+      // Match info (for reference)
+      matchScore: score,
+      cityMatches: cityMatches,
+      
+      // Detailed company info
+      details: {
+        ...details,
+        adresse_complete: result.address // Include the address from search results
+      }
+    });
+    
+    // Small delay to avoid overwhelming the server
+    await page.waitForTimeout(500);
+  }
+  
+  // Prepare response message
+  let message = `No exact match found (best score: ${bestMatch.score.toFixed(2)}). Showing top ${topResults.length} search results with detailed information.`;
+  if (normalizedCity) {
+    const cityMatchCount = recommendations.filter(r => r.cityMatches).length;
+    if (cityMatchCount > 0) {
+      message += ` ${cityMatchCount} result(s) are from ${city}.`;
+    } else {
+      message += ` No results found specifically in ${city}.`;
+    }
   }
   
   return {
     InputRaisonSociale: companyName,
-    Status: "Not Found - Showing Recommendations",
-    Message: "Exact match not found. Showing top 3 closest matches.",
+    InputCity: city || null,
+    Status: "Not Found - Showing Search Results",
+    Message: message,
+    BestMatchScore: bestMatch.score,
+    TotalResultsFound: results.length,
     Recommendations: recommendations
   };
 }
-
 /* =======================
    SESSION STATUS ENDPOINT
 ======================= */
@@ -706,10 +842,14 @@ app.post("/api/logout", async (req, res) => {
   
   loginStatus = {
     isLoggedIn: false,
+    status: 'disconnected',
     lastLoginAttempt: null,
     error: null,
-    sessionAge: null
+    sessionAge: null,
+    browserLaunchTime: null
   };
+  
+  broadcastStatus();
   
   res.json({ 
     success: true, 
@@ -717,7 +857,9 @@ app.post("/api/logout", async (req, res) => {
   });
 });
 
-
+/* =======================
+   ICE DATA ENDPOINT
+======================= */
 app.post("/api/ice", async (req, res) => {
   const ice = (req.body?.ice || "").trim();
 
