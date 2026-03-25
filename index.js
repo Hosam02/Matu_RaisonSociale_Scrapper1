@@ -120,112 +120,6 @@ function generateSearchVariants(name) {
 
   return [...variants];
 }
-async function runVariantsParallel(variants, normalizedCity, threshold = 0.9) {
-  const MAX_CONCURRENCY = 3; // 🔥 keep this LOW (2–4 max)
-
-  let bestMatch = { score: 0 };
-  let bestResult = null;
-  let found = false;
-
-  const context = await browser.newContext();
-
-  let active = 0;
-  let index = 0;
-
-  return new Promise((resolve) => {
-    const runNext = async () => {
-      if (found || index >= variants.length) {
-        if (active === 0) {
-          context.close();
-          resolve(bestResult);
-        }
-        return;
-      }
-
-      const variant = variants[index++];
-      active++;
-
-      const pageLocal = await context.newPage();
-
-      try {
-        const attempt = await runOneSearchWithPage(pageLocal, variant, normalizedCity);
-
-        if (attempt.bestMatch.score > bestMatch.score) {
-          bestMatch = attempt.bestMatch;
-          bestResult = attempt;
-        }
-
-        // 🎯 STOP condition
-        if (attempt.bestMatch.score >= threshold) {
-          found = true;
-        }
-      } catch (err) {
-        console.error("Variant error:", variant, err.message);
-      }
-
-      await pageLocal.close();
-      active--;
-
-      runNext();
-    };
-
-    // start workers
-    for (let i = 0; i < MAX_CONCURRENCY; i++) {
-      runNext();
-    }
-  });
-}
-async function runOneSearchWithPage(page, query, normalizedCity) {
-  await page.goto("https://www.charika.ma/accueil", {
-    waitUntil: "domcontentloaded",
-    timeout: 10000,
-  });
-
-  const searchInput = await page.waitForSelector(
-    'input.rq-form-element[name="sDenomination"]:visible, input[placeholder*="raison sociale"]:visible',
-    { timeout: 5000 }
-  );
-
-  await searchInput.fill(query);
-  await searchInput.press("Enter");
-
-  await page.waitForURL("**/societe-rechercher**", { timeout: 10000 }).catch(() => {});
-  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
-
-  const results = await page.$$eval("div.text-soc", (items) =>
-    items.map((item) => {
-      const link = item.querySelector("h5 a");
-      const addressLabels = Array.from(
-        item.querySelectorAll("div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label")
-      ).map((l) => l.innerText.trim());
-      return {
-        name: link?.innerText.trim() || "",
-        href: link?.getAttribute("href") || "",
-        address: addressLabels.join(" "),
-      };
-    })
-  );
-
-  const queryClean = cleanName(query);
-  let bestMatch = { index: -1, score: 0 };
-
-  for (let i = 0; i < results.length; i++) {
-    const r = results[i];
-    const score = similarity(queryClean, cleanName(r.name));
-    const cityOk = !normalizedCity || normalizeString(r.address).includes(normalizedCity);
-
-    if (score === 1 && cityOk) {
-      bestMatch = { index: i, score, ...r };
-      break;
-    }
-
-    if (score > bestMatch.score) {
-      bestMatch = { index: i, score, ...r };
-    }
-  }
-
-  return { results, bestMatch };
-}
  
  
 // NEW HELPER 2: run one Charika search, return scored results
@@ -789,13 +683,22 @@ async function performSearch(companyName, city) {
   // Step 2: if no good match, try space-split variants
   if (bestMatch.score < 0.9) {
     const variants = generateSearchVariants(clean);
-    const attempt = await runVariantsParallel(variants, normalizedCity, 0.9);
-
-if (attempt && attempt.bestMatch.score > bestMatch.score) {
-  bestMatch = attempt.bestMatch;
-  results = attempt.results;
-  usedQuery = "parallel-variant";
-}
+ 
+    for (const variant of variants) {
+      console.log(`  Retrying with variant: "${variant}"`);
+      const attempt = await runOneSearch(variant, normalizedCity);
+ 
+      if (attempt.bestMatch.score > bestMatch.score) {
+        bestMatch = attempt.bestMatch;
+        results   = attempt.results;
+        usedQuery = variant;
+      }
+ 
+      if (bestMatch.score >= 0.95) {
+        console.log(`  Variant matched: "${variant}" score=${bestMatch.score.toFixed(2)}`);
+        break;
+      }
+    }
   }
  
   // Step 3: still nothing at all
