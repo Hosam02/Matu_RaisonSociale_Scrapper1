@@ -18,10 +18,36 @@ app.use(express.json());
 
 const { username, password } = config.auth;
 const LEGAL_NOISE = new Set([
-  "SOCIETE","STE","STÉ","SARL","SA","S","A","R","L",
-  //"COMPAGNIE","CIE","ET","DE","DES","DU","TRANSPORT","VOYAGE",
-]);
+  // General words
+  "SOCIETE", "STE", "STÉ",
 
+  // SARL variations
+  "SARL", "S.A.R.L", "S A R L", "S. A. R. L", "S.A R.L", "S A.R.L",
+
+  // SA variations
+  "SA", "S.A", "S A", "S.A.",
+
+  // SNC variations
+  "SNC", "S.N.C", "S N C", "S.N.C.",
+
+  // SCS variations
+  "SCS", "S.C.S", "S C S", "S.C.S.",
+
+  // SCA variations
+  "SCA", "S.C.A", "S C A", "S.C.A.",
+
+  // EURL variations
+  "EURL", "E.U.R.L", "E U R L", "E.U.R.L.",
+
+  // SC (Société Civile / Coopérative)
+  "SC", "S.C", "S C", "S.C.",
+
+  // Auto-entrepreneur
+  "AE", "A.E", "A E", "A.E.",
+
+  // Association à but non lucratif
+  "ABNL", "A.B.N.L", "A B N L", "A.B.N.L."
+]);
 // Pre-compile regex patterns
 const NOISE_PATTERNS = Array.from(LEGAL_NOISE).map(word => 
   new RegExp(`\\b${word}\\b`, "gi")
@@ -37,10 +63,21 @@ function normalizeString(str) {
 
 function cleanName(name) {
   if (!name) return "";
-  let cleaned = name.toUpperCase();
+
+  let cleaned = name
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "") // remove accents
+    .toUpperCase()
+    
+    // 🔥 normalize punctuation
+    .replace(/[.\-_/]/g, " ")   // replace ., -, _, / with space
+    .replace(/[^A-Z0-9\s]/g, "") // remove any other weird chars
+
+  // remove legal noise
   for (const pattern of NOISE_PATTERNS) {
     cleaned = cleaned.replace(pattern, "");
   }
+
   return cleaned.replace(/\s+/g, " ").trim();
 }
 
@@ -57,6 +94,190 @@ function parseRC(rcText) {
     RCNumber: match ? match[1] : rcText,
     RCTribunal: match ? match[2] : null
   };
+}
+
+function generateSearchVariants(name) {
+  const words = name.trim().split(/\s+/);
+  const variants = new Set();
+
+  // 🔹 1. Existing logic (split inside words)
+  words.forEach((word, wi) => {
+    if (word.length <= 3) return;
+
+    for (let split = 1; split < word.length; split++) {
+      const newWords = [...words];
+      newWords[wi] = word.slice(0, split) + " " + word.slice(split);
+      variants.add(newWords.join(" "));
+    }
+  });
+
+  // 🔥 2. NEW: if multiple words → add dot / merge / hyphen variants
+  if (words.length > 1) {
+    variants.add(words.join("."));  // HI.TEX
+    variants.add(words.join(""));   // HITEX
+    variants.add(words.join("-"));  // HI-TEX
+  }
+
+  return [...variants];
+}
+async function runVariantsParallel(variants, normalizedCity, threshold = 0.9) {
+  const MAX_CONCURRENCY = 3; // 🔥 keep this LOW (2–4 max)
+
+  let bestMatch = { score: 0 };
+  let bestResult = null;
+  let found = false;
+
+  const context = await browser.newContext();
+
+  let active = 0;
+  let index = 0;
+
+  return new Promise((resolve) => {
+    const runNext = async () => {
+      if (found || index >= variants.length) {
+        if (active === 0) {
+          context.close();
+          resolve(bestResult);
+        }
+        return;
+      }
+
+      const variant = variants[index++];
+      active++;
+
+      const pageLocal = await context.newPage();
+
+      try {
+        const attempt = await runOneSearchWithPage(pageLocal, variant, normalizedCity);
+
+        if (attempt.bestMatch.score > bestMatch.score) {
+          bestMatch = attempt.bestMatch;
+          bestResult = attempt;
+        }
+
+        // 🎯 STOP condition
+        if (attempt.bestMatch.score >= threshold) {
+          found = true;
+        }
+      } catch (err) {
+        console.error("Variant error:", variant, err.message);
+      }
+
+      await pageLocal.close();
+      active--;
+
+      runNext();
+    };
+
+    // start workers
+    for (let i = 0; i < MAX_CONCURRENCY; i++) {
+      runNext();
+    }
+  });
+}
+async function runOneSearchWithPage(page, query, normalizedCity) {
+  await page.goto("https://www.charika.ma/accueil", {
+    waitUntil: "domcontentloaded",
+    timeout: 10000,
+  });
+
+  const searchInput = await page.waitForSelector(
+    'input.rq-form-element[name="sDenomination"]:visible, input[placeholder*="raison sociale"]:visible',
+    { timeout: 5000 }
+  );
+
+  await searchInput.fill(query);
+  await searchInput.press("Enter");
+
+  await page.waitForURL("**/societe-rechercher**", { timeout: 10000 }).catch(() => {});
+  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+
+  const results = await page.$$eval("div.text-soc", (items) =>
+    items.map((item) => {
+      const link = item.querySelector("h5 a");
+      const addressLabels = Array.from(
+        item.querySelectorAll("div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label")
+      ).map((l) => l.innerText.trim());
+      return {
+        name: link?.innerText.trim() || "",
+        href: link?.getAttribute("href") || "",
+        address: addressLabels.join(" "),
+      };
+    })
+  );
+
+  const queryClean = cleanName(query);
+  let bestMatch = { index: -1, score: 0 };
+
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const score = similarity(queryClean, cleanName(r.name));
+    const cityOk = !normalizedCity || normalizeString(r.address).includes(normalizedCity);
+
+    if (score === 1 && cityOk) {
+      bestMatch = { index: i, score, ...r };
+      break;
+    }
+
+    if (score > bestMatch.score) {
+      bestMatch = { index: i, score, ...r };
+    }
+  }
+
+  return { results, bestMatch };
+}
+ 
+ 
+// NEW HELPER 2: run one Charika search, return scored results
+async function runOneSearch(query, normalizedCity) {
+  await page.goto("https://www.charika.ma/accueil", {
+    waitUntil: "domcontentloaded",
+    timeout: 10000,
+  });
+ 
+  const searchInput = await page.waitForSelector(
+    'input.rq-form-element[name="sDenomination"]:visible, input[placeholder*="raison sociale"]:visible',
+    { timeout: 5000 }
+  );
+ 
+  await searchInput.fill("");
+  await searchInput.type(query, { delay: 20 });
+  await searchInput.press("Enter");
+  await page.waitForURL("**/societe-rechercher**", { timeout: 10000 }).catch(() => {});
+  await page.waitForLoadState("domcontentloaded", { timeout: 10000 }).catch(() => {});
+ 
+  const results = await page.$$eval("div.text-soc", (items) =>
+    items.map((item) => {
+      const link = item.querySelector("h5 a");
+      const addressLabels = Array.from(
+        item.querySelectorAll("div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label")
+      ).map((l) => l.innerText.trim());
+      return {
+        name:    link?.innerText.trim() || "",
+        href:    link?.getAttribute("href") || "",
+        address: addressLabels.join(" "),
+      };
+    })
+  );
+ 
+  const queryClean = cleanName(query);
+  let bestMatch = { index: -1, score: 0, name: "", href: "", address: "" };
+ 
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    const score  = similarity(queryClean, cleanName(r.name));
+    const cityOk = !normalizedCity || normalizeString(r.address).includes(normalizedCity);
+ 
+    if (score === 1 && (!normalizedCity || cityOk)) {
+      bestMatch = { index: i, score: 1, name: r.name, href: r.href, address: r.address };
+      break;
+    }
+    if (score > bestMatch.score) {
+      bestMatch = { index: i, score, name: r.name, href: r.href, address: r.address };
+    }
+  }
+ 
+  return { results, bestMatch };
 }
 
 // Function to extract company details from a page
@@ -547,279 +768,187 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
+// REPLACEMENT performSearch() -- delete the old one and paste this instead
 async function performSearch(companyName, city) {
   const normalizedCity = city ? normalizeString(city) : null;
-  
-  // Navigate to home page
-  await page.goto("https://www.charika.ma/accueil", { 
-    waitUntil: "domcontentloaded",
-    timeout: 8000
-  });
-  
-  // Find and fill search input
-  const searchInput = await page.waitForSelector(
-    'input.rq-form-element[name="sDenomination"]:visible, ' +
-    'input[placeholder*="raison sociale"]:visible', 
-    { timeout: 5000 }
-  );
-  
-  await searchInput.fill("");
-  await searchInput.type(companyName, { delay: 20 });
-  await Promise.all([
-    page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5000 }),
-    searchInput.press("Enter")
-  ]);
-  
-  // Extract search results
-  const results = await page.$$eval('div.text-soc', (items) => {
-    return items.map(item => {
-      const link = item.querySelector('h5 a');
-      const name = link?.innerText.trim() || '';
-      const href = link?.getAttribute('href') || '';
-      
-      const addressLabels = Array.from(item.querySelectorAll(
-        'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
-      )).map(l => l.innerText.trim());
-      const address = addressLabels.join(' ');
-      
-      return { name, href, address };
+ 
+  // Recovery guard: wait for any in-flight navigation to settle
+  try {
+    await page.waitForLoadState("domcontentloaded", { timeout: 5000 });
+  } catch {
+    await page.goto("https://www.charika.ma/accueil", {
+      waitUntil: "domcontentloaded",
+      timeout: 15000,
     });
-  });
-  
+  }
+ 
+  // Step 1: try original name
+  let { results, bestMatch } = await runOneSearch(companyName, normalizedCity);
+  let usedQuery = companyName;
+  const clean = cleanName(companyName);
+  // Step 2: if no good match, try space-split variants
+  if (bestMatch.score < 0.9) {
+    const variants = generateSearchVariants(clean);
+    const attempt = await runVariantsParallel(variants, normalizedCity, 0.9);
+
+if (attempt && attempt.bestMatch.score > bestMatch.score) {
+  bestMatch = attempt.bestMatch;
+  results = attempt.results;
+  usedQuery = "parallel-variant";
+}
+  }
+ 
+  // Step 3: still nothing at all
   if (results.length === 0) {
     return {
       InputRaisonSociale: companyName,
       Status: "Not Found",
-      Message: "No results found for your search query."
+      Message: "No results found (including all space-split variants).",
     };
   }
-  
-  // Find best match (for scoring purposes)
-  const companyClean = cleanName(companyName);
-  let bestMatch = { index: -1, score: 0, name: '', href: '' };
-  
-  for (let i = 0; i < results.length; i++) {
-    const result = results[i];
-    const cleanedResult = cleanName(result.name);
-    const score = similarity(companyClean, cleanedResult);
-    const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
-    
-    // Check for exact match with city filter
-    
-    if (score === 1 && (!normalizedCity || cityMatches)) {
-      bestMatch = { index: i, score: 1, name: result.name, href: result.href, address: result.address };
-      break;
-    }
-    if (score > bestMatch.score) {
-      bestMatch = { index: i, score, name: result.name, href: result.href, address: result.address };
-    }
-  }
-  
-  // If we have a good match (score >= 0.8), return that company's details
-  if (bestMatch.score >= 0.8 && bestMatch.index !== -1) {
-    // Navigate to the best match's page
-    await Promise.all([
-      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 5000 }),
-      page.goto(`https://www.charika.ma/${bestMatch.href}`)
-    ]);
-    
-    // Extract company details
-    const info = await page.evaluate(({ companyName, foundName, bestScore }) => {
-      const result = {
-        InputRaisonSociale: companyName,
-        FoundRaisonSociale: foundName,
-        Status: "Found",
-        MatchScore: bestScore,
-        IsExactMatch: bestScore >= 0.95
-      };
-      
-      const table = document.querySelector('div.col-md-7 table.informations-entreprise');
-      if (table) {
-        const rows = table.querySelectorAll('tbody tr');
-        rows.forEach(row => {
-          const cells = row.querySelectorAll('td');
-          if (cells.length >= 2) {
+ 
+  // Step 4: good match -- fetch detail page
+  if (bestMatch.score >= 0.95 && bestMatch.index !== -1) {
+    await page.goto(`https://www.charika.ma/${bestMatch.href}`, {
+      waitUntil: "domcontentloaded",
+      timeout: 10000,
+    });
+ 
+    const info = await page.evaluate(
+      ({ companyName, foundName, bestScore, usedQuery }) => {
+        const result = {
+          InputRaisonSociale: companyName,
+          FoundRaisonSociale: foundName,
+          Status:             "Found",
+          MatchScore:         bestScore,
+          IsExactMatch:       bestScore >= 0.95,
+          UsedQuery:          usedQuery,
+        };
+ 
+        const table = document.querySelector("div.col-md-7 table.informations-entreprise");
+        if (table) {
+          table.querySelectorAll("tbody tr").forEach((row) => {
+            const cells = row.querySelectorAll("td");
+            if (cells.length < 2) return;
             const field = cells[0].innerText.trim();
             const value = cells[1].innerText.trim();
-            
-            if (field.includes('RC') || field.includes('Registre')) {
-              const match = value.match(/^(\d+)\s*\((.+)\)$/);
-              result.RCNumber = match ? match[1] : value;
-              result.RCTribunal = match ? match[2] : null;
-            } else if (field.includes('ICE')) result.ICE = value;
-            else if (field.includes('Forme juridique')) result.FormeJuridique = value;
-            else if (field.includes('Capital')) result.Capital = value;
-            else if (field.includes('Activité')) result.Activite = value;
-            else if (field.includes('Adresse')) result.Address = value;
+            if      (field.includes("RC") || field.includes("Registre")) {
+              const m = value.match(/^(\d+)\s*\((.+)\)$/);
+              result.RCNumber   = m ? m[1] : value;
+              result.RCTribunal = m ? m[2] : null;
+            }
+            else if (field.includes("ICE"))             result.ICE            = value;
+            else if (field.includes("Forme juridique")) result.FormeJuridique = value;
+            else if (field.includes("Capital"))         result.Capital        = value;
+            else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
+            else if (field.includes("Adresse"))         result.Address        = value;
+            else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
+            else if (field.includes("Fax"))             result.Fax            = value;
+            else if (field.includes("Email"))           result.Email          = value;
+            else if (field.includes("Site web"))        result.SiteWeb        = value;
             else result[field] = value;
-          }
-        });
-      }
-      
-      const addressLabels = Array.from(document.querySelectorAll(
-        'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
-      )).map(l => l.innerText.trim());
-      if (addressLabels.length) {
-        result.Address = addressLabels.join(' ');
-      }
-      
-      return result;
-    }, { 
-      companyName, 
-      foundName: bestMatch.name, 
-      bestScore: bestMatch.score 
-    });
-    
-    if (!info.Address) {
-      info.Address = bestMatch.address || "";
-    }
-
+          });
+        }
+ 
+        return result;
+      },
+      { companyName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
+    );
+ 
+    // Fallback address from search listing
+    if (!info.Address) info.Address = bestMatch.address || "";
+ 
     if (normalizedCity && info.Address) {
       info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
     }
+ 
     return info;
   }
-  
-  // No good match found - return top 3 search results with detailed info
-  const topResults = results.slice(0, 3); // Take first 3 results as they appear on Charika
+ 
+  // Step 5: no good match -- return top 3 recommendations
+  const topResults = results.slice(0, 3);
   const recommendations = [];
-  
-  // Get detailed info for each top result
+ 
   for (const result of topResults) {
-    console.log(`🔍 Fetching details for: ${result.name}`);
-    
-    // Navigate to the company page
-    await page.goto(`https://www.charika.ma/${result.href}`, { 
+    console.log(`Fetching details for: ${result.name}`);
+ 
+    await page.goto(`https://www.charika.ma/${result.href}`, {
       waitUntil: "domcontentloaded",
-      timeout: 8000 
+      timeout: 10000,
     });
-    
-    // Extract detailed information
+ 
     const details = await page.evaluate(() => {
       const result = {};
-      
-      // Get company name from the title or heading
-      const titleElement = document.querySelector('h1');
-      if (titleElement) {
-        result.NomCommercial = titleElement.innerText.trim();
-      }
-      
-      // Extract from information table
-      const table = document.querySelector('div.col-md-7 table.informations-entreprise');
+      const titleElement = document.querySelector("h1");
+      if (titleElement) result.NomCommercial = titleElement.innerText.trim();
+ 
+      const table = document.querySelector("div.col-md-7 table.informations-entreprise");
       if (table) {
-        const rows = table.querySelectorAll('tbody tr');
-        rows.forEach(row => {
-          const cells = row.querySelectorAll('td');
-          if (cells.length >= 2) {
-            const field = cells[0].innerText.trim();
-            const value = cells[1].innerText.trim();
-            
-            if (field.includes('RC') || field.includes('Registre')) {
-              const match = value.match(/^(\d+)\s*\((.+)\)$/);
-              result.RCNumber = match ? match[1] : value;
-              result.RCTribunal = match ? match[2] : null;
-            } else if (field.includes('ICE')) {
-              result.ICE = value;
-            } else if (field.includes('Forme juridique')) {
-              result.FormeJuridique = value;
-            } else if (field.includes('Capital')) {
-              result.Capital = value;
-            } else if (field.includes('Activité')) {
-              result.Activite = value;
-            } else if (field.includes('Adresse')) {
-              result.Adresse = value;
-            } else if (field.includes('Tél')) {
-              result.Telephone = value;
-            } else if (field.includes('Fax')) {
-              result.Fax = value;
-            } else if (field.includes('Email')) {
-              result.Email = value;
-            } else if (field.includes('Site web')) {
-              result.SiteWeb = value;
-            } else {
-              // Store other fields dynamically
-              const key = field.replace(/[^a-zA-Z0-9]/g, '');
-              result[key] = value;
-            }
+        table.querySelectorAll("tbody tr").forEach((row) => {
+          const cells = row.querySelectorAll("td");
+          if (cells.length < 2) return;
+          const field = cells[0].innerText.trim();
+          const value = cells[1].innerText.trim();
+          if      (field.includes("RC") || field.includes("Registre")) {
+            const m = value.match(/^(\d+)\s*\((.+)\)$/);
+            result.RCNumber   = m ? m[1] : value;
+            result.RCTribunal = m ? m[2] : null;
           }
+          else if (field.includes("ICE"))             result.ICE            = value;
+          else if (field.includes("Forme juridique")) result.FormeJuridique = value;
+          else if (field.includes("Capital"))         result.Capital        = value;
+          else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
+          else if (field.includes("Adresse"))         result.Adresse        = value;
+          else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
+          else if (field.includes("Fax"))             result.Fax            = value;
+          else if (field.includes("Email"))           result.Email          = value;
+          else if (field.includes("Site web"))        result.SiteWeb        = value;
+          else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
         });
       }
-      
-      // 🔥 ADD HERE
-if (!result.Address) {
-  const keywords = [
-    "rue", "avenue", "bd", "boulevard", "lot", "km",
-    "quartier", "hay", "zone", "résidence", "immeuble",
-    "magasin", "n°", "casablanca", "rabat", "fès", "marrakech"
-  ];
-
-  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
-  let node;
-  const candidates = [];
-
-  while ((node = walker.nextNode())) {
-    const text = node.textContent.trim();
-
-    if (
-      text.length > 20 &&
-      keywords.some(k => text.toLowerCase().includes(k))
-    ) {
-      candidates.push(text);
-    }
-  }
-
-  if (candidates.length) {
-    result.Address = candidates.sort((a, b) => b.length - a.length)[0];
-  }
-}
-      
+ 
+      if (!result.Adresse) {
+        const labels = Array.from(document.querySelectorAll(
+          "div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label"
+        )).map((l) => l.innerText.trim());
+        if (labels.length) result.Adresse = labels.join(" ");
+      }
+ 
       return result;
     });
-    
-    // Calculate match score for informational purposes
-    const score = similarity(companyName, result.name);
+ 
+    const score       = similarity(companyName, result.name);
     const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
-    
+ 
     recommendations.push({
-      // Basic info
-      name: result.name,
-      url: `https://www.charika.ma/${result.href}`,
-      position: results.indexOf(result) + 1,
-      
-      // Match info (for reference)
+      name:       result.name,
+      url:        `https://www.charika.ma/${result.href}`,
+      position:   topResults.indexOf(result) + 1,
       matchScore: score,
-      cityMatches: cityMatches,
-      
-      // Detailed company info
-      details: {
-        ...details,
-        adresse_complete: result.address // Include the address from search results
-      }
+      cityMatches,
+      details: { ...details, adresse_complete: result.address },
     });
-    
-    // Small delay to avoid overwhelming the server
-    await page.waitForTimeout(500);
+ 
+    await page.waitForTimeout(300);
   }
-  
-  // Prepare response message
-  let message = `No exact match found (best score: ${bestMatch.score.toFixed(2)}). Showing top ${topResults.length} search results with detailed information.`;
+ 
+  const variantCount = generateSearchVariants(companyName).length;
+  let message = `No exact match found (best score: ${bestMatch.score.toFixed(2)}, tried ${1 + variantCount} query variant(s)). Showing top ${topResults.length} results.`;
   if (normalizedCity) {
-    const cityMatchCount = recommendations.filter(r => r.cityMatches).length;
-    if (cityMatchCount > 0) {
-      message += ` ${cityMatchCount} result(s) are from ${city}.`;
-    } else {
-      message += ` No results found specifically in ${city}.`;
-    }
+    const cityMatchCount = recommendations.filter((r) => r.cityMatches).length;
+    message += cityMatchCount > 0
+      ? ` ${cityMatchCount} result(s) from ${city}.`
+      : ` None from ${city}.`;
   }
-  
+ 
   return {
     InputRaisonSociale: companyName,
-    InputCity: city || null,
-    Status: "Not Found - Showing Search Results",
-    Message: message,
-    BestMatchScore: bestMatch.score,
-    TotalResultsFound: results.length,
-    Recommendations: recommendations
+    InputCity:          city || null,
+    Status:             "Not Found - Showing Search Results",
+    Message:            message,
+    BestMatchScore:     bestMatch.score,
+    TotalResultsFound:  results.length,
+    Recommendations:    recommendations,
   };
 }
 // ── Multer: store upload in memory (no temp files on disk) ──────────
