@@ -4,7 +4,11 @@ import { WebSocketServer } from "ws";
 import { chromium } from "playwright";
 import levenshtein from "fast-levenshtein";
 import config from "./config.js";
+import multer from "multer";
+import * as XLSX from "xlsx";
 import { fetchIceData } from "./icegov.js";
+import fs from "fs";
+import path from "path";
 
 const app = express();
 const server = createServer(app);
@@ -15,7 +19,7 @@ app.use(express.json());
 const { username, password } = config.auth;
 const LEGAL_NOISE = new Set([
   "SOCIETE","STE","STÉ","SARL","SA","S","A","R","L",
-  "COMPAGNIE","CIE","ET","DE","DES","DU","TRANSPORT","TRANS","VOYAGE","TOURS"
+  //"COMPAGNIE","CIE","ET","DE","DES","DU","TRANSPORT","VOYAGE",
 ]);
 
 // Pre-compile regex patterns
@@ -601,14 +605,13 @@ async function performSearch(companyName, city) {
     const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
     
     // Check for exact match with city filter
+    
     if (score === 1 && (!normalizedCity || cityMatches)) {
-      bestMatch = { index: i, score: 1, name: result.name, href: result.href };
+      bestMatch = { index: i, score: 1, name: result.name, href: result.href, address: result.address };
       break;
     }
-    
-    // Track best score
     if (score > bestMatch.score) {
-      bestMatch = { index: i, score, name: result.name, href: result.href };
+      bestMatch = { index: i, score, name: result.name, href: result.href, address: result.address };
     }
   }
   
@@ -646,6 +649,8 @@ async function performSearch(companyName, city) {
             } else if (field.includes('ICE')) result.ICE = value;
             else if (field.includes('Forme juridique')) result.FormeJuridique = value;
             else if (field.includes('Capital')) result.Capital = value;
+            else if (field.includes('Activité')) result.Activite = value;
+            else if (field.includes('Adresse')) result.Address = value;
             else result[field] = value;
           }
         });
@@ -665,10 +670,13 @@ async function performSearch(companyName, city) {
       bestScore: bestMatch.score 
     });
     
+    if (!info.Address) {
+      info.Address = bestMatch.address || "";
+    }
+
     if (normalizedCity && info.Address) {
       info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
     }
-    
     return info;
   }
   
@@ -737,15 +745,33 @@ async function performSearch(companyName, city) {
         });
       }
       
-      // Try to get address from alternative location
-      if (!result.Adresse) {
-        const addressLabels = Array.from(document.querySelectorAll(
-          'div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label'
-        )).map(l => l.innerText.trim());
-        if (addressLabels.length) {
-          result.Adresse = addressLabels.join(' ');
-        }
-      }
+      // 🔥 ADD HERE
+if (!result.Address) {
+  const keywords = [
+    "rue", "avenue", "bd", "boulevard", "lot", "km",
+    "quartier", "hay", "zone", "résidence", "immeuble",
+    "magasin", "n°", "casablanca", "rabat", "fès", "marrakech"
+  ];
+
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node;
+  const candidates = [];
+
+  while ((node = walker.nextNode())) {
+    const text = node.textContent.trim();
+
+    if (
+      text.length > 20 &&
+      keywords.some(k => text.toLowerCase().includes(k))
+    ) {
+      candidates.push(text);
+    }
+  }
+
+  if (candidates.length) {
+    result.Address = candidates.sort((a, b) => b.length - a.length)[0];
+  }
+}
       
       return result;
     });
@@ -796,6 +822,218 @@ async function performSearch(companyName, city) {
     Recommendations: recommendations
   };
 }
+// ── Multer: store upload in memory (no temp files on disk) ──────────
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB max
+  fileFilter: (_req, file, cb) => {
+    const ok =
+      file.mimetype ===
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+      file.mimetype === "application/vnd.ms-excel" ||
+      file.originalname.endsWith(".xlsx") ||
+      file.originalname.endsWith(".xls");
+    cb(ok ? null : new Error("Only Excel files (.xlsx / .xls) are accepted"), ok);
+  },
+});
+ 
+// ── Helper: extract { idClients, name, city } from a raw row ─────────
+// IdClients: read exactly as "IdClients" (or common case variants)
+// name:      RaisonSociale / name / nom / company / société  (or first column)
+// city:      Ville / city / wilaya / region / localite
+function extractRowFields(row) {
+  const keys = Object.keys(row);
+  const find = (...candidates) =>
+    keys.find((k) =>
+      candidates.some((c) => k.toLowerCase().trim() === c.toLowerCase())
+    );
+ 
+  // IdClients – try exact name first, then common variants
+  const idKey = find("idclients", "id_clients", "idclient", "id_client", "id");
+ 
+  const nameKey =
+    find("raisonsociale", "raison_sociale", "name", "nom", "company", "société") ||
+    keys.find((k) => k !== idKey) || // first non-id column
+    keys[0];
+ 
+  const cityKey = find("ville", "city", "wilaya", "region", "localite", "localité");
+ 
+  return {
+    idClients: idKey ? row[idKey]?.toString().trim() || "" : "",
+    name:      row[nameKey]?.toString().trim() || "",
+    city:      cityKey ? row[cityKey]?.toString().trim() || "" : "",
+  };
+}
+ 
+// ── Build the output workbook ─────────────────────────────────────────
+//
+// Sheet 1 – "Results"
+//   • Found rows   → 1 row,  Status = "Found"
+//   • Not-found    → N rows (one per suggestion), Status = "Not Found – Suggestion"
+//   • Error rows   → 1 row,  Status = "Error"
+//
+// Sheet 2 – "Errors"  (quick-filter subset of Sheet 1)
+// ─────────────────────────────────────────────────────────────────────
+function buildResultWorkbook(results) {
+  const wb = XLSX.utils.book_new();
+ 
+  // ── Sheet 1: Results ─────────────────────────────────────────────
+  const resultRows = [];
+ 
+  for (const r of results) {
+    const base = {
+      IdClients:              r.input.idClients || "",
+      "Input Raison Sociale": r.input.name,
+      "Input City":           r.input.city || "",
+    };
+ 
+    // ── Error ────────────────────────────────────────────────────
+    if (r.error) {
+      resultRows.push({
+        ...base,
+        Status:                 "Error",
+        "Found Raison Sociale": "",
+        "Suggestion #":         "",
+        "Match Score":          "",
+        ICE:                    "",
+        RC:                     "",
+        "RC Tribunal":          "",
+        "Forme Juridique":      "",
+        Capital:                "",
+        Adresse:                "",
+        "Error / Message":      r.error,
+        "Response Time (ms)":   r.responseTime || "",
+      });
+      continue;
+    }
+ 
+    const res = r.result;
+ 
+    // ── Found ────────────────────────────────────────────────────
+    if (res.Status === "Found") {
+      resultRows.push({
+        ...base,
+        Status:                 "Found",
+        "Found Raison Sociale": res.FoundRaisonSociale || "",
+        "Suggestion #":         "",
+        "Match Score":          res.MatchScore != null
+                                  ? (res.MatchScore * 100).toFixed(1) + "%"
+                                  : "",
+        ICE:                    res.ICE || "",
+        RC:                     res.RCNumber || "",
+        "RC Tribunal":          res.RCTribunal || "",
+        "Forme Juridique":      res.FormeJuridique || "",
+        Capital:                res.Capital || "",
+        Adresse:                res.Address || res.Adresse || "",
+        "Error / Message":      "",
+        "Response Time (ms)":   r.responseTime || "",
+      });
+ 
+    // ── Not found – expand suggestions as individual rows ────────
+    } else if (res.Recommendations?.length) {
+      res.Recommendations.forEach((rec, j) => {
+        resultRows.push({
+          ...base,                       // IdClients, Input Raison Sociale, Input City repeated on every suggestion row
+          Status:                 "Not Found – Suggestion",
+          "Found Raison Sociale": rec.name || "",
+          "Suggestion #":         j + 1,
+          "Match Score":          rec.matchScore != null
+                                    ? (rec.matchScore * 100).toFixed(1) + "%"
+                                    : "",
+          ICE:                    rec.details?.ICE || "",
+          RC:                     rec.details?.RCNumber || "",
+          "RC Tribunal":          rec.details?.RCTribunal || "",
+          "Forme Juridique":      rec.details?.FormeJuridique || "",
+          Capital:                rec.details?.Capital || "",
+          Adresse:                rec.details?.Adresse
+                                    || rec.details?.adresse_complete
+                                    || "",
+          "Error / Message":      "",
+          // Response time only on the first suggestion row to avoid duplication
+          "Response Time (ms)":   j === 0 ? r.responseTime || "" : "",
+        });
+      });
+ 
+    // ── Not found, no suggestions at all ────────────────────────
+    } else {
+      resultRows.push({
+        ...base,
+        Status:                 res.Status || "Not Found",
+        "Found Raison Sociale": "",
+        "Suggestion #":         "",
+        "Match Score":          "",
+        ICE:                    "",
+        RC:                     "",
+        "RC Tribunal":          "",
+        "Forme Juridique":      "",
+        Capital:                "",
+        Adresse:                "",
+        "Error / Message":      res.Message || "",
+        "Response Time (ms)":   r.responseTime || "",
+      });
+    }
+  }
+ 
+  const resultSheet = XLSX.utils.json_to_sheet(resultRows);
+  resultSheet["!cols"] = [
+    { wch: 15 }, // IdClients
+    { wch: 35 }, // Input Raison Sociale
+    { wch: 18 }, // Input City
+    { wch: 28 }, // Status
+    { wch: 35 }, // Found Raison Sociale
+    { wch: 12 }, // Suggestion #
+    { wch: 12 }, // Match Score
+    { wch: 18 }, // ICE
+    { wch: 12 }, // RC
+    { wch: 20 }, // RC Tribunal
+    { wch: 20 }, // Forme Juridique
+    { wch: 15 }, // Capital
+    { wch: 45 }, // Adresse
+    { wch: 45 }, // Error / Message
+    { wch: 16 }, // Response Time
+  ];
+  XLSX.utils.book_append_sheet(wb, resultSheet, "Results");
+ 
+  // ── Sheet 2: Errors (quick-filter view) ──────────────────────────
+  const errorRows = results
+    .filter((r) => r.error)
+    .map((r) => ({
+      IdClients:              r.input.idClients || "",
+      "Input Raison Sociale": r.input.name,
+      "Input City":           r.input.city || "",
+      Error:                  r.error,
+      "Response Time (ms)":   r.responseTime || "",
+    }));
+ 
+  if (errorRows.length) {
+    const errSheet = XLSX.utils.json_to_sheet(errorRows);
+    errSheet["!cols"] = [
+      { wch: 15 },
+      { wch: 35 },
+      { wch: 18 },
+      { wch: 60 },
+      { wch: 16 },
+    ];
+    XLSX.utils.book_append_sheet(wb, errSheet, "Errors");
+  }
+ 
+  return wb;
+}
+// Folder where bulk-search result files are saved
+const RESULTS_DIR = path.resolve("./bulk-results");
+if (!fs.existsSync(RESULTS_DIR)) {
+  fs.mkdirSync(RESULTS_DIR, { recursive: true });
+  console.log(`📁 Created results folder: ${RESULTS_DIR}`);
+}
+function getNextResultFilename() {
+  const existing = fs.readdirSync(RESULTS_DIR)
+    .filter((f) => /^results_\d+\.xlsx$/.test(f))
+    .map((f) => parseInt(f.match(/^results_(\d+)\.xlsx$/)[1], 10));
+ 
+  const next = existing.length > 0 ? Math.max(...existing) + 1 : 1;
+  return path.join(RESULTS_DIR, `results_${next}.xlsx`);
+}
+ 
 /* =======================
    SESSION STATUS ENDPOINT
 ======================= */
@@ -880,6 +1118,368 @@ app.post("/api/ice", async (req, res) => {
     });
   }
 });
+// =====================================================================
+// ROUTE – POST /api/bulk-search
+// =====================================================================
+ 
+app.post(
+  "/api/bulk-search",
+  upload.single("file"), // form-data field name: "file"
+  async (req, res) => {
+    // ── 1. Validate upload ──────────────────────────────────────────
+    if (!req.file) {
+      return res.status(400).json({
+        success: false,
+        error: 'No file uploaded. Send the Excel file in a form-data field named "file".',
+      });
+    }
+ 
+    // ── 2. Parse Excel ──────────────────────────────────────────────
+    let rows;
+    try {
+      const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+      const ws = wb.Sheets[wb.SheetNames[0]]; // always use first sheet
+      rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+    } catch {
+      return res.status(400).json({ success: false, error: "Could not parse Excel file." });
+    }
+ 
+    if (!rows.length) {
+      return res.status(400).json({ success: false, error: "The Excel file is empty." });
+    }
+ 
+    // ── 3. Validate session ─────────────────────────────────────────
+    const isLoggedIn = await ensureLoggedIn();
+    if (!isLoggedIn || !page) {
+      return res.status(401).json({
+        success: false,
+        error: "Not authenticated. Call POST /api/login first.",
+      });
+    }
+ 
+    // ── 4. Optional query params ────────────────────────────────────
+    const concurrency  = Math.min(parseInt(req.query.concurrency || "1"), 3);
+    const stopOnError  = req.query.stopOnError === "true";
+    const outputFormat = (req.query.format || "excel").toLowerCase(); // "excel" | "json"
+ 
+    console.log(
+      `📊 Bulk search started – ${rows.length} row(s), concurrency=${concurrency}, format=${outputFormat}`
+    );
+ 
+    // ── 5. Process rows ─────────────────────────────────────────────
+    const results = new Array(rows.length);
+    let processed = 0;
+    let found     = 0;
+    let notFound  = 0;
+    let errors    = 0;
+ 
+    async function processRow(row, index) {
+      const { idClients, name, city } = extractRowFields(row);
+ 
+      if (!name) {
+        results[index] = {
+          input: { idClients, name: "", city },
+          error: "Empty company name – row skipped",
+          responseTime: 0,
+        };
+        errors++;
+        processed++;
+        return;
+      }
+ 
+      const t0 = Date.now();
+      try {
+        const result       = await performSearch(name, city || undefined);
+        const responseTime = Date.now() - t0;
+ 
+        results[index] = { input: { idClients, name, city }, result, responseTime };
+ 
+        if (result.Status === "Found") found++;
+        else notFound++;
+ 
+        const suggCount = result.Recommendations?.length
+          ? ` (${result.Recommendations.length} suggestion(s))`
+          : "";
+        console.log(
+          `  [${index + 1}/${rows.length}] [${idClients || "—"}] "${name}" → ${result.Status}${suggCount} (${responseTime} ms)`
+        );
+      } catch (err) {
+        const responseTime = Date.now() - t0;
+        results[index] = {
+          input: { idClients, name, city },
+          error: err.message,
+          responseTime,
+        };
+        errors++;
+        console.error(
+          `  [${index + 1}/${rows.length}] [${idClients || "—"}] "${name}" → ERROR: ${err.message}`
+        );
+        if (stopOnError) throw err;
+      }
+ 
+      processed++;
+    }
+ 
+    try {
+      if (concurrency === 1) {
+        // Purely sequential – one search at a time, safe for a single Playwright page
+        for (let i = 0; i < rows.length; i++) {
+          await processRow(rows[i], i);
+        }
+      } else {
+        // Batched concurrency
+        for (let i = 0; i < rows.length; i += concurrency) {
+          const batch = rows
+            .slice(i, i + concurrency)
+            .map((row, j) => processRow(row, i + j));
+          await Promise.all(batch);
+        }
+      }
+    } catch (abortErr) {
+      console.warn("⚠️  Bulk search aborted early:", abortErr.message);
+    }
+ 
+    const summary = { total: rows.length, processed, found, notFound, errors };
+    console.log("✅ Bulk search complete –", summary);
+ 
+    // ── 6. Return response ──────────────────────────────────────────
+    if (outputFormat === "json") {
+      return res.json({ success: true, summary, results });
+    }
+ 
+    // Save Excel file to the results folder (no download prompt for the caller)
+    try {
+      const outWb    = buildResultWorkbook(results);
+      const buffer   = XLSX.write(outWb, { type: "buffer", bookType: "xlsx" });
+      const filePath = getNextResultFilename();
+      const fileName = path.basename(filePath);
+ 
+      fs.writeFileSync(filePath, buffer);
+      console.log(`💾 Results saved to: ${filePath}`);
+ 
+      // Return a JSON confirmation — no file download
+      return res.json({
+        success:  true,
+        summary,
+        savedAs:  fileName,
+        savedPath: filePath,
+      });
+    } catch (xlsxErr) {
+      console.error("Failed to build/save Excel output:", xlsxErr);
+      return res.status(500).json({
+        success: false,
+        error:   "Search completed but failed to save Excel output.",
+        summary,
+      });
+    }
+  }
+);
+app.post("/api/debug-search", async (req, res) => {
+  const { name, city } = req.body;
+ 
+  if (!name) {
+    return res.status(400).json({ error: "name is required" });
+  }
+ 
+  const isLoggedIn = await ensureLoggedIn();
+  if (!isLoggedIn || !page) {
+    return res.status(401).json({ error: "Not authenticated. Call /api/login first." });
+  }
+ 
+  const log = [];   // step-by-step trace
+  const warn = [];  // things that look wrong
+ 
+  try {
+    // ── 1. Navigate & search ──────────────────────────────────────
+    log.push("Navigating to charika.ma...");
+    await page.goto("https://www.charika.ma/accueil", {
+      waitUntil: "domcontentloaded",
+      timeout: 8000,
+    });
+ 
+    const searchInput = await page.waitForSelector(
+      'input.rq-form-element[name="sDenomination"]:visible, input[placeholder*="raison sociale"]:visible',
+      { timeout: 5000 }
+    );
+    await searchInput.fill("");
+    await searchInput.type(name, { delay: 20 });
+    await Promise.all([
+      page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 8000 }),
+      searchInput.press("Enter"),
+    ]);
+ 
+    log.push(`Search submitted for: "${name}"`);
+ 
+    // ── 2. Grab raw search results ────────────────────────────────
+    const searchResults = await page.$$eval("div.text-soc", (items) =>
+      items.map((item) => {
+        const link = item.querySelector("h5 a");
+        const addressLabels = Array.from(
+          item.querySelectorAll("div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label")
+        ).map((l) => l.innerText.trim());
+        return {
+          name:    link?.innerText.trim() || "",
+          href:    link?.getAttribute("href") || "",
+          address: addressLabels.join(" "),
+        };
+      })
+    );
+ 
+    log.push(`Found ${searchResults.length} result(s) on search page`);
+ 
+    if (searchResults.length === 0) {
+      return res.json({ log, warn, searchResults: [], detail: null });
+    }
+ 
+    // Score and pick best match (mirrors performSearch logic)
+    const companyClean = cleanName(name);
+    const normalizedCity = city ? normalizeString(city) : null;
+ 
+    let bestMatch = { index: -1, score: 0, name: "", href: "", address: "" };
+    const scored = searchResults.map((r, i) => {
+      const score = similarity(companyClean, cleanName(r.name));
+      const cityOk = !normalizedCity || normalizeString(r.address).includes(normalizedCity);
+      if (score > bestMatch.score) {
+        bestMatch = { index: i, score, name: r.name, href: r.href, address: r.address };
+      }
+      return { ...r, score: +score.toFixed(4), cityOk };
+    });
+ 
+    log.push(`Best match: "${bestMatch.name}" — score ${bestMatch.score.toFixed(4)}`);
+    log.push(`Address from search listing: "${bestMatch.address || "(empty)"}"`);
+ 
+    if (bestMatch.score < 0.8) {
+      warn.push(`Score ${bestMatch.score.toFixed(4)} is below 0.8 — would NOT be treated as Found`);
+    }
+ 
+    // ── 3. Navigate to company detail page ───────────────────────
+    const detailUrl = `https://www.charika.ma/${bestMatch.href}`;
+    log.push(`Navigating to detail page: ${detailUrl}`);
+ 
+    await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 10000 });
+ 
+    // ── 4. Full DOM diagnostic on the detail page ─────────────────
+    const domDiag = await page.evaluate(() => {
+      const diag = {
+        pageTitle:   document.title,
+        h1Text:      document.querySelector("h1")?.innerText.trim() || null,
+ 
+        // ── Info table ──────────────────────────────────────────
+        tableFound:  !!document.querySelector("div.col-md-7 table.informations-entreprise"),
+        tableRows:   [],
+ 
+        // ── Alternative address selectors ───────────────────────
+        altAddress1: Array.from(document.querySelectorAll(
+          "div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label"
+        )).map((l) => l.innerText.trim()),
+ 
+        altAddress2: Array.from(document.querySelectorAll(
+          "div.nopaddingleft label"
+        )).map((l) => l.innerText.trim()),
+ 
+        altAddress3: document.querySelector(".adresse, .address, [class*='adresse'], [class*='address']")
+          ?.innerText.trim() || null,
+ 
+        // ── All visible text that contains typical address words ─
+        addressKeywordMatches: (() => {
+          const keywords = ["rue", "avenue", "bd", "boulevard", "lot", "km", "angle",
+                            "quartier", "hay", "zone", "résidence", "immeuble", "n°",
+                            "casablanca", "rabat", "marrakech", "fès", "agadir"];
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          const hits = [];
+          let node;
+          while ((node = walker.nextNode())) {
+            const txt = node.textContent.trim();
+            if (txt.length > 10 && keywords.some((k) => txt.toLowerCase().includes(k))) {
+              hits.push(txt.substring(0, 200));
+            }
+          }
+          // Deduplicate
+          return [...new Set(hits)].slice(0, 20);
+        })(),
+ 
+        // ── Raw HTML of the info table for inspection ───────────
+        tableHtml: document.querySelector("div.col-md-7 table.informations-entreprise")
+          ?.innerHTML.replace(/\s+/g, " ").trim().substring(0, 3000) || null,
+ 
+        // ── All <td> pairs in the table ─────────────────────────
+        allTdPairs: (() => {
+          const table = document.querySelector("div.col-md-7 table.informations-entreprise");
+          if (!table) return [];
+          return Array.from(table.querySelectorAll("tbody tr")).map((row) => {
+            const cells = row.querySelectorAll("td");
+            return {
+              field: cells[0]?.innerText.trim() || "",
+              value: cells[1]?.innerText.trim() || "",
+            };
+          });
+        })(),
+      };
+ 
+      return diag;
+    });
+ 
+    // ── 5. Analyse the diagnostic ─────────────────────────────────
+    if (!domDiag.tableFound) {
+      warn.push("INFO TABLE NOT FOUND — selector 'div.col-md-7 table.informations-entreprise' matched nothing");
+    } else {
+      log.push(`Info table found — ${domDiag.allTdPairs.length} row(s)`);
+    }
+ 
+    const adresseRow = domDiag.allTdPairs.find(
+      (p) => p.field.includes("Adresse") || p.field.includes("adresse")
+    );
+ 
+    if (adresseRow) {
+      log.push(`Adresse row found in table: field="${adresseRow.field}" value="${adresseRow.value}"`);
+      if (!adresseRow.value) {
+        warn.push("Adresse row EXISTS but its value cell is EMPTY");
+      }
+    } else {
+      warn.push("No row with 'Adresse' found inside the info table");
+    }
+ 
+    if (domDiag.altAddress1.length) {
+      log.push(`Alt selector 1 (col-md-8 label) found: ${JSON.stringify(domDiag.altAddress1)}`);
+    } else {
+      warn.push("Alt selector 1 (div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label) → no matches");
+    }
+ 
+    if (domDiag.altAddress2.length) {
+      log.push(`Alt selector 2 (div.nopaddingleft label) found: ${JSON.stringify(domDiag.altAddress2)}`);
+    } else {
+      warn.push("Alt selector 2 (div.nopaddingleft label) → no matches");
+    }
+ 
+    if (domDiag.altAddress3) {
+      log.push(`Alt selector 3 ([class*=adresse]) found: "${domDiag.altAddress3}"`);
+    } else {
+      warn.push("Alt selector 3 ([class*=adresse/address]) → no match");
+    }
+ 
+    if (domDiag.addressKeywordMatches.length) {
+      log.push(`Address keyword scan found ${domDiag.addressKeywordMatches.length} text node(s) that look like addresses`);
+    } else {
+      warn.push("Address keyword scan found NOTHING that looks like an address on this page");
+    }
+ 
+    // ── 6. Return full report ─────────────────────────────────────
+    return res.json({
+      input:           { name, city: city || null },
+      bestMatch:       { name: bestMatch.name, href: bestMatch.href, score: bestMatch.score, addressFromListing: bestMatch.address },
+      scoredResults:   scored,
+      log,
+      warnings:        warn,
+      domDiagnostic:   domDiag,
+      detailUrl,
+    });
+ 
+  } catch (err) {
+    log.push(`ERROR: ${err.message}`);
+    return res.status(500).json({ log, warn, error: err.message });
+  }
+});
+
 
 // Clean up idle browser
 setInterval(async () => {
