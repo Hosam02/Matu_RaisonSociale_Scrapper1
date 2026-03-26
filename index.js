@@ -46,12 +46,23 @@ const LEGAL_NOISE = new Set([
   "AE", "A.E", "A E", "A.E.",
 
   // Association à but non lucratif
-  "ABNL", "A.B.N.L", "A B N L", "A.B.N.L."
+  "ABNL", "A.B.N.L", "A B N L", "A.B.N.L.",
+  
+  "AU", "A.U", "A.U.",
 ]);
 // Pre-compile regex patterns
 const NOISE_PATTERNS = Array.from(LEGAL_NOISE).map(word => 
   new RegExp(`\\b${word}\\b`, "gi")
 );
+let pagePool = [];
+const MAX_PAGES = 3;
+let pageIndex = 0;
+
+function getPage() {
+  const p = pagePool[pageIndex % pagePool.length];
+  pageIndex++;
+  return p;
+}
 
 function normalizeString(str) {
   return str
@@ -83,10 +94,20 @@ function cleanName(name) {
 
 function similarity(a, b) {
   if (!a || !b) return 0;
-  const maxLen = Math.max(a.length, b.length);
-  return maxLen === 0 ? 0 : 1 - levenshtein.get(a, b) / maxLen;
-}
 
+  const cleanA = cleanName(a);
+  const cleanB = cleanName(b);
+
+  const compactA = cleanA.replace(/\s+/g, "");
+  const compactB = cleanB.replace(/\s+/g, "");
+
+  const scoreNormal = 1 - levenshtein.get(cleanA, cleanB) / Math.max(cleanA.length, cleanB.length);
+
+  const scoreCompact = 1 - levenshtein.get(compactA, compactB) / Math.max(compactA.length, compactB.length);
+
+  // 🔥 TAKE THE BEST
+  return Math.max(scoreNormal, scoreCompact);
+}
 function parseRC(rcText) {
   if (!rcText) return { RCNumber: null, RCTribunal: null };
   const match = rcText.match(/^(\d+)\s*\((.+)\)$/);
@@ -96,34 +117,91 @@ function parseRC(rcText) {
   };
 }
 
+async function safeRunSearch(page, query, normalizedCity, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await runOneSearch(page, query, normalizedCity);
+    } catch (err) {
+      if (i === retries) throw err;
+      await new Promise(r => setTimeout(r, 400));
+    }
+  }
+}
+
+// function generateSearchVariants(name) {
+//   const cleaned = cleanName(name);
+//   const words = cleaned.split(/\s+/).filter(Boolean);
+
+//   const variants = new Set();
+
+//   // Always include original
+//   variants.add(cleaned);
+
+//   // Multi-word variations
+//   if (words.length > 1) {
+//     variants.add(words.join(""));   // HITEX
+//     variants.add(words.join("."));  // HI.TEX
+//     variants.add(words.join("-"));  // HI-TEX
+//   }
+
+//   // 🔥 Only split if it's ONE BIG WORD (very important)
+//   if (words.length === 1 && words[0].length >= 6) {
+//     const word = words[0];
+
+//     // Only 2–3 meaningful splits (not all positions)
+//     const splits = [
+//       Math.floor(word.length / 2),
+//       Math.floor(word.length / 3),
+//       Math.floor((2 * word.length) / 3),
+//     ];
+
+//     for (const i of splits) {
+//       if (i > 2 && i < word.length - 2) {
+//         variants.add(word.slice(0, i) + " " + word.slice(i));
+//       }
+//     }
+//   }
+
+//   return [...variants];
+// }
+ 
+// NEW HELPER 2: run one Charika search, return scored results
 function generateSearchVariants(name) {
-  const words = name.trim().split(/\s+/);
+  const cleaned = cleanName(name);
+  const words = cleaned.split(/\s+/).filter(Boolean);
+
   const variants = new Set();
 
-  // 🔹 1. Existing logic (split inside words)
-  words.forEach((word, wi) => {
-    if (word.length <= 3) return;
+  // Always include original
+  variants.add(cleaned);
 
-    for (let split = 1; split < word.length; split++) {
-      const newWords = [...words];
-      newWords[wi] = word.slice(0, split) + " " + word.slice(split);
-      variants.add(newWords.join(" "));
-    }
-  });
-
-  // 🔥 2. NEW: if multiple words → add dot / merge / hyphen variants
+  // If already multiple words → add compact forms
   if (words.length > 1) {
-    variants.add(words.join("."));  // HI.TEX
     variants.add(words.join(""));   // HITEX
+    variants.add(words.join("."));  // HI.TEX
     variants.add(words.join("-"));  // HI-TEX
+  }
+
+  // 🔥 KEY FIX: aggressive splitting for single word
+  if (words.length === 1) {
+    const word = words[0];
+
+    // try ALL reasonable splits
+    for (let i = 2; i <= word.length - 2; i++) {
+      const left = word.slice(0, i);
+      const right = word.slice(i);
+
+      // avoid useless splits like H ITEX
+      if (left.length < 2 || right.length < 2) continue;
+
+      variants.add(`${left} ${right}`); // HI TEX
+    }
   }
 
   return [...variants];
 }
- 
- 
-// NEW HELPER 2: run one Charika search, return scored results
-async function runOneSearch(query, normalizedCity) {
+
+async function runOneSearch(page, query, normalizedCity){
   await page.goto("https://www.charika.ma/accueil", {
     waitUntil: "domcontentloaded",
     timeout: 10000,
@@ -466,9 +544,16 @@ async function initializeBrowserAndLogin() {
     userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
   });
 
-  page = await context.newPage();
-  page.setDefaultTimeout(15000);
+  pagePool = [];
 
+  for (let i = 0; i < MAX_PAGES; i++) {
+    const p = await context.newPage();
+    p.setDefaultTimeout(15000);
+    pagePool.push(p);
+  }
+
+// Keep one main page for login/session
+page = pagePool[0];
   console.log("🌐 Navigating to Charika.ma...");
   await page.goto("https://www.charika.ma/accueil", { 
     waitUntil: "domcontentloaded",
@@ -606,6 +691,9 @@ async function refreshSession() {
     return false;
   }
 }
+function compactString(str) {
+  return cleanName(str).replace(/\s+/g, "");
+}
 
 /* =======================
    SEARCH ENDPOINT - WITH TOP 3 RECOMMENDATIONS
@@ -634,8 +722,8 @@ app.post("/api/search", async (req, res) => {
         ResponseTime: Date.now() - startTime
       });
     }
-
-    const result = await performSearch(name, city);
+    const localPage = getPage();
+    const result = await performSearch(name, city, localPage);
     result.ResponseTime = Date.now() - startTime;
     
     res.json(result);
@@ -663,7 +751,7 @@ app.post("/api/search", async (req, res) => {
 });
 
 // REPLACEMENT performSearch() -- delete the old one and paste this instead
-async function performSearch(companyName, city) {
+async function performSearch(companyName, city, page) {
   const normalizedCity = city ? normalizeString(city) : null;
  
   // Recovery guard: wait for any in-flight navigation to settle
@@ -677,16 +765,16 @@ async function performSearch(companyName, city) {
   }
  
   // Step 1: try original name
-  let { results, bestMatch } = await runOneSearch(companyName, normalizedCity);
+  let { results, bestMatch } = await safeRunSearch(page,companyName, normalizedCity);
   let usedQuery = companyName;
   const clean = cleanName(companyName);
   // Step 2: if no good match, try space-split variants
-  if (bestMatch.score < 0.9) {
+  if (bestMatch.score < 0.92 && results.length > 0) {
     const variants = generateSearchVariants(clean);
  
     for (const variant of variants) {
       console.log(`  Retrying with variant: "${variant}"`);
-      const attempt = await runOneSearch(variant, normalizedCity);
+      const attempt = await safeRunSearch(page,variant, normalizedCity);
  
       if (attempt.bestMatch.score > bestMatch.score) {
         bestMatch = attempt.bestMatch;
@@ -694,7 +782,7 @@ async function performSearch(companyName, city) {
         usedQuery = variant;
       }
  
-      if (bestMatch.score >= 0.95) {
+      if (bestMatch.score >= 0.93) {
         console.log(`  Variant matched: "${variant}" score=${bestMatch.score.toFixed(2)}`);
         break;
       }
@@ -769,7 +857,9 @@ async function performSearch(companyName, city) {
   }
  
   // Step 5: no good match -- return top 3 recommendations
-  const topResults = results.slice(0, 3);
+  const topResults = results
+  .filter(r => similarity(companyName, r.name) > 0.5)
+  .slice(0, 3);
   const recommendations = [];
  
   for (const result of topResults) {
@@ -1221,7 +1311,8 @@ app.post(
  
       const t0 = Date.now();
       try {
-        const result       = await performSearch(name, city || undefined);
+        const localPage = getPage();
+        const result = await performSearch(name, city || undefined, localPage);
         const responseTime = Date.now() - t0;
  
         results[index] = { input: { idClients, name, city }, result, responseTime };
@@ -1265,6 +1356,7 @@ app.post(
             .slice(i, i + concurrency)
             .map((row, j) => processRow(row, i + j));
           await Promise.all(batch);
+          await new Promise(r => setTimeout(r, 200));
         }
       }
     } catch (abortErr) {
