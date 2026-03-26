@@ -25,7 +25,7 @@ const LEGAL_NOISE = new Set([
   "SARL", "S.A.R.L", "S A R L", "S. A. R. L", "S.A R.L", "S A.R.L",
 
   // SA variations
-  "SA", "S.A", "S A", "S.A.",
+  "SA", "S.A", "S.A.",
 
   // SNC variations
   "SNC", "S.N.C", "S N C", "S.N.C.",
