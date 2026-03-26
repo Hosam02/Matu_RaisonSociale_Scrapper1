@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 
-const WS_URL = 'ws://192.168.80.243:3005/status';
+const WS_URL = 'ws://localhost:3005/status';
 let ws = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT_ATTEMPTS = 10;
