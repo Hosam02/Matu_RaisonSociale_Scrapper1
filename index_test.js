@@ -10,7 +10,6 @@ import { fetchIceData } from "./icegov.js";
 import fs from "fs";
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
-
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/status' });
@@ -27,7 +26,7 @@ const LEGAL_NOISE = new Set([
   "SOCIETE", "STE", "STÉ",
 
   // SARL variations
-  "SARL", "S.A.R.L", "S A R L", "S. A. R. L", "S.A.R.L", "S A.R.L",
+  "SARL", "S.A.R.L", "S A R L", "S. A. R. L", "S.A R.L", "S A.R.L",
 
   // SA variations
   "SA", "S.A", "S A", "S.A.",
@@ -77,25 +76,6 @@ function normalizeString(str) {
     .trim() || "";
 }
 
-// function cleanName(name) {
-//   if (!name) return "";
-
-//   let cleaned = name
-//     .normalize("NFD")
-//     .replace(/[\u0300-\u036f]/g, "") // remove accents
-//     .toUpperCase()
-    
-//     // 🔥 normalize punctuation
-//     .replace(/[.\-_/]/g, " ")   // replace ., -, _, / with space
-//     .replace(/[^A-Z0-9\s]/g, "") // remove any other weird chars
-
-//   // remove legal noise
-//   for (const pattern of NOISE_PATTERNS) {
-//     cleaned = cleaned.replace(pattern, "");
-//   }
-
-//   return cleaned.replace(/\s+/g, " ").trim();
-// }
 function cleanName(name) {
   if (!name) return "";
 
@@ -113,42 +93,9 @@ function cleanName(name) {
     cleaned = cleaned.replace(pattern, "");
   }
 
-  cleaned = cleaned.replace(/\s+/g, " ").trim();
-  
-  // 🔥 CORRECTION SPÉCIFIQUE: Fusionner les initiales
-  // Sépare le texte en mots
-  const words = cleaned.split(/\s+/);
-  
-  // Parcourt les mots pour fusionner les initiales consécutives
-  const mergedWords = [];
-  let i = 0;
-  
-  while (i < words.length) {
-    // Si c'est une initiale (1 lettre) et qu'il y a un mot après
-    if (words[i].length === 1 && i + 1 < words.length) {
-      let initials = words[i];
-      let j = i + 1;
-      
-      // Continue tant que les mots suivants sont aussi des initiales
-      while (j < words.length && words[j].length === 1) {
-        initials += words[j];
-        j++;
-      }
-      
-      // Ajoute les initiales fusionnées
-      mergedWords.push(initials);
-      i = j;
-    } else {
-      // Mot normal, on le garde tel quel
-      mergedWords.push(words[i]);
-      i++;
-    }
-  }
-  
-  cleaned = mergedWords.join(' ');
-  
-  return cleaned;
+  return cleaned.replace(/\s+/g, " ").trim();
 }
+
 function similarity(a, b) {
   if (!a || !b) return 0;
 
@@ -220,6 +167,44 @@ async function safeRunSearch(page, query, normalizedCity, retries = 2) {
   }
 }
 
+// function generateSearchVariants(name) {
+//   const cleaned = cleanName(name);
+//   const words = cleaned.split(/\s+/).filter(Boolean);
+
+//   const variants = new Set();
+
+//   // Always include original
+//   variants.add(cleaned);
+
+//   // Multi-word variations
+//   if (words.length > 1) {
+//     variants.add(words.join(""));   // HITEX
+//     variants.add(words.join("."));  // HI.TEX
+//     variants.add(words.join("-"));  // HI-TEX
+//   }
+
+//   // 🔥 Only split if it's ONE BIG WORD (very important)
+//   if (words.length === 1 && words[0].length >= 6) {
+//     const word = words[0];
+
+//     // Only 2–3 meaningful splits (not all positions)
+//     const splits = [
+//       Math.floor(word.length / 2),
+//       Math.floor(word.length / 3),
+//       Math.floor((2 * word.length) / 3),
+//     ];
+
+//     for (const i of splits) {
+//       if (i > 2 && i < word.length - 2) {
+//         variants.add(word.slice(0, i) + " " + word.slice(i));
+//       }
+//     }
+//   }
+
+//   return [...variants];
+// }
+ 
+// NEW HELPER 2: run one Charika search, return scored results
 function generateSearchVariants(name) {
   const cleaned = cleanName(name);
   const words = cleaned.split(/\s+/).filter(Boolean);
@@ -541,7 +526,6 @@ setInterval(() => {
 wss.on('listening', () => {
   console.log('📡 WebSocket server listening on /status');
 });
-
 async function ensureFreshSession() {
   try {
     // Check if browser exists and is responsive
@@ -566,7 +550,6 @@ async function ensureFreshSession() {
     return false;
   }
 }
-
 /* =======================
    LOGIN ENDPOINT
 ======================= */
@@ -770,7 +753,6 @@ async function refreshSession() {
     return false;
   }
 }
-
 function compactString(str) {
   return cleanName(str).replace(/\s+/g, "");
 }
@@ -830,10 +812,10 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// IMPROVED performSearch() function with better handling for names like "STE K.J TRANS SARL"
+// REPLACEMENT performSearch() -- delete the old one and paste this instead
 async function performSearch(companyName, city, page) {
   const normalizedCity = city ? normalizeString(city) : null;
-  
+ 
   // Recovery guard: wait for any in-flight navigation to settle
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: 5000 });
@@ -843,110 +825,48 @@ async function performSearch(companyName, city, page) {
       timeout: 15000,
     });
   }
-  
-  // Store original name for logging
-  const originalName = companyName;
-  const cleanedOriginal = cleanName(originalName);
-  
+ 
   // Step 1: try original name
-  let { results, bestMatch } = await safeRunSearch(page, originalName, normalizedCity);
-  let usedQuery = originalName;
-  
-  // Log initial search results
-  console.log(`🔍 Search for "${originalName}" (cleaned: "${cleanedOriginal}") found ${results.length} results`);
-  if (bestMatch.name) {
-    console.log(`📊 Best match: "${bestMatch.name}" with score ${bestMatch.score.toFixed(4)}`);
-  }
-  
-  // Step 2: if no good match, try variants
+  let { results, bestMatch } = await safeRunSearch(page,companyName, normalizedCity);
+  let usedQuery = companyName;
+  const clean = cleanName(companyName);
+  // Step 2: if no good match, try space-split variants
   if (bestMatch.score < 0.92 && results.length > 0) {
-    const variants = generateSearchVariants(originalName);
-    
-    // 🔥 CRITICAL FIX: Add special variants for names with dots like "K.J"
-    const cleanWithoutDots = cleanedOriginal.replace(/\./g, '');
-    const specialVariants = [
-      cleanWithoutDots,                                    // "KJ TRANS"
-      cleanedOriginal.replace(/\s+/g, ''),                 // "KJTRANS"
-      cleanWithoutDots.replace(/\s+/g, ''),                // "KJTRANS"
-      cleanedOriginal.replace(/\./g, ' ').replace(/\s+/g, ' ').trim(), // "KJ TRANS" (clean)
-    ];
-    
-    // Add all special variants
-    specialVariants.forEach(v => {
-      if (v && v.length > 0) variants.push(v);
-    });
-    
-    // Remove duplicates
-    const uniqueVariants = [...new Set(variants)];
-    
-    for (const variant of uniqueVariants) {
-      console.log(`  🔄 Retrying with variant: "${variant}"`);
-      const attempt = await safeRunSearch(page, variant, normalizedCity);
-      
+    const variants = generateSearchVariants(clean);
+ 
+    for (const variant of variants) {
+      console.log(`  Retrying with variant: "${variant}"`);
+      const attempt = await safeRunSearch(page,variant, normalizedCity);
+ 
       if (attempt.bestMatch.score > bestMatch.score) {
         bestMatch = attempt.bestMatch;
         results   = attempt.results;
         usedQuery = variant;
-        console.log(`  ✅ Better match found: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
       }
-      
+ 
       if (bestMatch.score >= 0.93) {
-        console.log(`  🎯 Variant matched: "${variant}" score=${bestMatch.score.toFixed(4)}`);
+        console.log(`  Variant matched: "${variant}" score=${bestMatch.score.toFixed(2)}`);
         break;
       }
     }
   }
-  
-  // Step 3: If score is still low but we have results, try direct URL matching
-  if (bestMatch.score < 0.85 && results.length > 0) {
-    console.log(`  🔍 Attempting exact match after cleaning...`);
-    
-    // Try to find a result where the cleaned name matches exactly
-    const exactMatch = results.find(r => {
-      const cleanedResult = cleanName(r.name);
-      const cleanedOriginalClean = cleanName(originalName);
-      
-      // Check multiple matching strategies
-      const exactMatchAfterClean = cleanedResult === cleanedOriginalClean;
-      const matchWithoutDots = cleanedResult.replace(/\./g, '') === cleanedOriginalClean.replace(/\./g, '');
-      const matchWithoutSpaces = cleanedResult.replace(/\s+/g, '') === cleanedOriginalClean.replace(/\s+/g, '');
-      const matchPartial = cleanedResult.includes(cleanedOriginalClean) || cleanedOriginalClean.includes(cleanedResult);
-      
-      if (exactMatchAfterClean || matchWithoutDots || matchWithoutSpaces || matchPartial) {
-        console.log(`  🎯 Found match via cleaning: "${r.name}" matches "${originalName}"`);
-        return true;
-      }
-      return false;
-    });
-    
-    if (exactMatch) {
-      console.log(`  ✅ Exact match found by cleaning: "${exactMatch.name}"`);
-      bestMatch = {
-        index: results.indexOf(exactMatch),
-        score: 0.98, // High score for exact match after cleaning
-        name: exactMatch.name,
-        href: exactMatch.href,
-        address: exactMatch.address
-      };
-    }
-  }
-  
-  // Step 4: still nothing at all
+ 
+  // Step 3: still nothing at all
   if (results.length === 0) {
     return {
-      InputRaisonSociale: originalName,
+      InputRaisonSociale: companyName,
       Status: "Not Found",
       Message: "No results found (including all space-split variants).",
     };
   }
-  
-  // Step 5: good match -- fetch detail page (lowered threshold to 0.85 from 0.95)
-  if (bestMatch.score >= 0.85 && bestMatch.index !== -1) {
+ 
+  // Step 4: good match -- fetch detail page
+  if (bestMatch.score >= 0.95 && bestMatch.index !== -1) {
     await page.goto(`https://www.charika.ma/${bestMatch.href}`, {
       waitUntil: "domcontentloaded",
       timeout: 10000,
     });
-    
+ 
     const info = await page.evaluate(
       ({ companyName, foundName, bestScore, usedQuery }) => {
         const result = {
@@ -957,7 +877,7 @@ async function performSearch(companyName, city, page) {
           IsExactMatch:       bestScore >= 0.95,
           UsedQuery:          usedQuery,
         };
-        
+ 
         const table = document.querySelector("div.col-md-7 table.informations-entreprise");
         if (table) {
           table.querySelectorAll("tbody tr").forEach((row) => {
@@ -965,7 +885,7 @@ async function performSearch(companyName, city, page) {
             if (cells.length < 2) return;
             const field = cells[0].innerText.trim();
             const value = cells[1].innerText.trim();
-            if (field.includes("RC") || field.includes("Registre")) {
+            if      (field.includes("RC") || field.includes("Registre")) {
               const m = value.match(/^(\d+)\s*\((.+)\)$/);
               result.RCNumber   = m ? m[1] : value;
               result.RCTribunal = m ? m[2] : null;
@@ -982,45 +902,41 @@ async function performSearch(companyName, city, page) {
             else result[field] = value;
           });
         }
-        
+ 
         return result;
       },
-      { companyName: originalName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
+      { companyName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
     );
-    
+ 
     // Fallback address from search listing
     if (!info.Address) info.Address = bestMatch.address || "";
-    
+ 
     if (normalizedCity && info.Address) {
       info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
     }
-    
-    console.log(`✅ Successfully found: "${bestMatch.name}" (score: ${bestMatch.score.toFixed(4)})`);
-    
+ 
     return info;
   }
-  
-  // Step 6: no good match -- return top 3 recommendations
-  console.log(`⚠️ No good match found, returning top ${Math.min(3, results.length)} recommendations`);
-  
+ 
+  // Step 5: no good match -- return top 3 recommendations
   const topResults = results
-    .filter(r => similarity(originalName, r.name) > 0.5)
-    .slice(0, 3);
+  .filter(r => similarity(companyName, r.name) > 0.5)
+  .slice(0, 3);
   const recommendations = [];
-  
+ 
   for (const result of topResults) {
-    console.log(`📄 Fetching details for: ${result.name}`);
-    
+    console.log(`Fetching details for: ${result.name}`);
+ 
     await page.goto(`https://www.charika.ma/${result.href}`, {
       waitUntil: "domcontentloaded",
       timeout: 10000,
     });
-    
+ 
     const details = await page.evaluate(() => {
       const result = {};
       const titleElement = document.querySelector("h1");
       if (titleElement) result.NomCommercial = titleElement.innerText.trim();
-      
+ 
       const table = document.querySelector("div.col-md-7 table.informations-entreprise");
       if (table) {
         table.querySelectorAll("tbody tr").forEach((row) => {
@@ -1028,7 +944,7 @@ async function performSearch(companyName, city, page) {
           if (cells.length < 2) return;
           const field = cells[0].innerText.trim();
           const value = cells[1].innerText.trim();
-          if (field.includes("RC") || field.includes("Registre")) {
+          if      (field.includes("RC") || field.includes("Registre")) {
             const m = value.match(/^(\d+)\s*\((.+)\)$/);
             result.RCNumber   = m ? m[1] : value;
             result.RCTribunal = m ? m[2] : null;
@@ -1045,20 +961,20 @@ async function performSearch(companyName, city, page) {
           else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
         });
       }
-      
+ 
       if (!result.Adresse) {
         const labels = Array.from(document.querySelectorAll(
           "div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label"
         )).map((l) => l.innerText.trim());
         if (labels.length) result.Adresse = labels.join(" ");
       }
-      
+ 
       return result;
     });
-    
-    const score       = similarity(originalName, result.name);
+ 
+    const score       = similarity(companyName, result.name);
     const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
-    
+ 
     recommendations.push({
       name:       result.name,
       url:        `https://www.charika.ma/${result.href}`,
@@ -1067,11 +983,11 @@ async function performSearch(companyName, city, page) {
       cityMatches,
       details: { ...details, adresse_complete: result.address },
     });
-    
+ 
     await page.waitForTimeout(300);
   }
-  
-  const variantCount = generateSearchVariants(originalName).length;
+ 
+  const variantCount = generateSearchVariants(companyName).length;
   let message = `No exact match found (best score: ${bestMatch.score.toFixed(2)}, tried ${1 + variantCount} query variant(s)). Showing top ${topResults.length} results.`;
   if (normalizedCity) {
     const cityMatchCount = recommendations.filter((r) => r.cityMatches).length;
@@ -1079,9 +995,9 @@ async function performSearch(companyName, city, page) {
       ? ` ${cityMatchCount} result(s) from ${city}.`
       : ` None from ${city}.`;
   }
-  
+ 
   return {
-    InputRaisonSociale: originalName,
+    InputRaisonSociale: companyName,
     InputCity:          city || null,
     Status:             "Not Found - Showing Search Results",
     Message:            message,
@@ -1090,7 +1006,6 @@ async function performSearch(companyName, city, page) {
     Recommendations:    recommendations,
   };
 }
-
 // ── Multer: store upload in memory (no temp files on disk) ──────────
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -1107,6 +1022,9 @@ const upload = multer({
 });
  
 // ── Helper: extract { idClients, name, city } from a raw row ─────────
+// IdClients: read exactly as "IdClients" (or common case variants)
+// name:      RaisonSociale / name / nom / company / société  (or first column)
+// city:      Ville / city / wilaya / region / localite
 function extractRowFields(row) {
   const keys = Object.keys(row);
   const find = (...candidates) =>
@@ -1132,6 +1050,14 @@ function extractRowFields(row) {
 }
  
 // ── Build the output workbook ─────────────────────────────────────────
+//
+// Sheet 1 – "Results"
+//   • Found rows   → 1 row,  Status = "Found"
+//   • Not-found    → N rows (one per suggestion), Status = "Not Found – Suggestion"
+//   • Error rows   → 1 row,  Status = "Error"
+//
+// Sheet 2 – "Errors"  (quick-filter subset of Sheet 1)
+// ─────────────────────────────────────────────────────────────────────
 function buildResultWorkbook(results) {
   const wb = XLSX.utils.book_new();
  
@@ -1207,6 +1133,7 @@ function buildResultWorkbook(results) {
                                     || rec.details?.adresse_complete
                                     || "",
           "Error / Message":      "",
+          // Response time only on the first suggestion row to avoid duplication
           "Response Time (ms)":   j === 0 ? r.responseTime || "" : "",
         });
       });
@@ -1276,14 +1203,12 @@ function buildResultWorkbook(results) {
  
   return wb;
 }
-
 // Folder where bulk-search result files are saved
 const RESULTS_DIR = path.resolve("./bulk-results");
 if (!fs.existsSync(RESULTS_DIR)) {
   fs.mkdirSync(RESULTS_DIR, { recursive: true });
   console.log(`📁 Created results folder: ${RESULTS_DIR}`);
 }
-
 function getNextResultFilename() {
   const existing = fs.readdirSync(RESULTS_DIR)
     .filter((f) => /^results_\d+\.xlsx$/.test(f))
@@ -1377,11 +1302,280 @@ app.post("/api/ice", async (req, res) => {
     });
   }
 });
+// =====================================================================
+// ROUTE – POST /api/bulk-search
+// =====================================================================
+ 
+// app.post(
+//   "/api/bulk-search",
+//   upload.single("file"), // form-data field name: "file"
+//   async (req, res) => {
+//     // ── 1. Validate upload ──────────────────────────────────────────
+//     if (!req.file) {
+//       return res.status(400).json({
+//         success: false,
+//         error: 'No file uploaded. Send the Excel file in a form-data field named "file".',
+//       });
+//     }
+ 
+//     // ── 2. Parse Excel ──────────────────────────────────────────────
+//     let rows;
+//     try {
+//       const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+//       const ws = wb.Sheets[wb.SheetNames[0]]; // always use first sheet
+//       rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+//     } catch {
+//       return res.status(400).json({ success: false, error: "Could not parse Excel file." });
+//     }
+ 
+//     if (!rows.length) {
+//       return res.status(400).json({ success: false, error: "The Excel file is empty." });
+//     }
+ 
+//     // ── 3. Validate session ─────────────────────────────────────────
+//     const isLoggedIn = await ensureLoggedIn();
+//     if (!isLoggedIn || !page) {
+//       return res.status(401).json({
+//         success: false,
+//         error: "Not authenticated. Call POST /api/login first.",
+//       });
+//     }
+ 
+//     // ── 4. Optional query params ────────────────────────────────────
+//     const concurrency  = Math.min(parseInt(req.query.concurrency || "1"), 3);
+//     const stopOnError  = req.query.stopOnError === "true";
+//     const outputFormat = (req.query.format || "excel").toLowerCase(); // "excel" | "json"
+ 
+//     console.log(
+//       `📊 Bulk search started – ${rows.length} row(s), concurrency=${concurrency}, format=${outputFormat}`
+//     );
+ 
+//     // ── 5. Process rows ─────────────────────────────────────────────
+//     const results = new Array(rows.length);
+//     let processed = 0;
+//     let found     = 0;
+//     let notFound  = 0;
+//     let errors    = 0;
+ 
+//     async function processRow(row, index) {
+//       const { idClients, name, city } = extractRowFields(row);
+ 
+//       if (!name) {
+//         results[index] = {
+//           input: { idClients, name: "", city },
+//           error: "Empty company name – row skipped",
+//           responseTime: 0,
+//         };
+//         errors++;
+//         processed++;
+//         return;
+//       }
+ 
+//       const t0 = Date.now();
+//       try {
+//         const localPage = getPage();
+//         const result = await performSearch(name, city || undefined, localPage);
+//         const responseTime = Date.now() - t0;
+ 
+//         results[index] = { input: { idClients, name, city }, result, responseTime };
+ 
+//         if (result.Status === "Found") found++;
+//         else notFound++;
+ 
+//         const suggCount = result.Recommendations?.length
+//           ? ` (${result.Recommendations.length} suggestion(s))`
+//           : "";
+//         console.log(
+//           `  [${index + 1}/${rows.length}] [${idClients || "—"}] "${name}" → ${result.Status}${suggCount} (${responseTime} ms)`
+//         );
+//       } catch (err) {
+//         const responseTime = Date.now() - t0;
+//         results[index] = {
+//           input: { idClients, name, city },
+//           error: err.message,
+//           responseTime,
+//         };
+//         errors++;
+//         console.error(
+//           `  [${index + 1}/${rows.length}] [${idClients || "—"}] "${name}" → ERROR: ${err.message}`
+//         );
+//         if (stopOnError) throw err;
+//       }
+ 
+//       processed++;
+//     }
+ 
+//     try {
+//       if (concurrency === 1) {
+//         // Purely sequential – one search at a time, safe for a single Playwright page
+//         for (let i = 0; i < rows.length; i++) {
+//           await processRow(rows[i], i);
+//         }
+//       } else {
+//         // Batched concurrency
+//         for (let i = 0; i < rows.length; i += concurrency) {
+//           const batch = rows
+//             .slice(i, i + concurrency)
+//             .map((row, j) => processRow(row, i + j));
+//           await Promise.all(batch);
+//           await new Promise(r => setTimeout(r, 200));
+//         }
+//       }
+//     } catch (abortErr) {
+//       console.warn("⚠️  Bulk search aborted early:", abortErr.message);
+//     }
+ 
+//     const summary = { total: rows.length, processed, found, notFound, errors };
+//     console.log("✅ Bulk search complete –", summary);
+ 
+//     // ── 6. Return response ──────────────────────────────────────────
+//     if (outputFormat === "json") {
+//       return res.json({ success: true, summary, results });
+//     }
+ 
+//     // Save Excel file to the results folder (no download prompt for the caller)
+//     try {
+//       const outWb    = buildResultWorkbook(results);
+//       const buffer   = XLSX.write(outWb, { type: "buffer", bookType: "xlsx" });
+//       const filePath = getNextResultFilename();
+//       const fileName = path.basename(filePath);
+ 
+//       fs.writeFileSync(filePath, buffer);
+//       console.log(`💾 Results saved to: ${filePath}`);
+ 
+//       // Return a JSON confirmation — no file download
+//       return res.json({
+//         success:  true,
+//         summary,
+//         savedAs:  fileName,
+//         savedPath: filePath,
+//       });
+//     } catch (xlsxErr) {
+//       console.error("Failed to build/save Excel output:", xlsxErr);
+//       return res.status(500).json({
+//         success: false,
+//         error:   "Search completed but failed to save Excel output.",
+//         summary,
+//       });
+//     }
+//   }
+// );
+const jobs = {}; // in-memory job store
+// app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
+//   if (!req.file) {
+//     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
+//   }
 
-// Bulk search jobs storage
-const jobs = {};
+//   let rows;
+//   try {
+//     const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+//     const ws = wb.Sheets[wb.SheetNames[0]];
+//     rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+//   } catch {
+//     return res.status(400).json({ success: false, error: "Invalid Excel file." });
+//   }
 
-// Bulk search endpoint with improved session management
+//   if (!rows.length) {
+//     return res.status(400).json({ success: false, error: "Empty file." });
+//   }
+
+//   const jobId = uuidv4();
+//   jobs[jobId] = {
+//     status: "running",
+//     processed: 0,
+//     total: rows.length,
+//     summary: null,
+//     resultFile: null,
+//     errors: 0,
+//     found: 0,
+//     notFound: 0
+//   };
+
+//   res.json({ success: true, jobId, message: "Bulk job started" });
+
+//   // Background processing
+//   (async () => {
+//     try {
+//     const { startIndex, results } = loadProgress(rows.length);
+//     const concurrency = Math.min(parseInt(req.query.concurrency || "2"), 3);
+//     const failedIndexes = [];
+
+//     for (let i = startIndex; i < rows.length; i += BATCH_SIZE) { // batch size 5
+//       const batch = rows.slice(i, i + 5);
+
+//       await ensureFreshSession();
+
+//       for (let j = 0; j < batch.length; j += concurrency) {
+//         const subBatch = batch
+//   .slice(j, j + concurrency)
+//   .map((row, k) => {
+//     const index = i + j + k;
+//     return (async () => {
+//       const { idClients, name, city } = extractRowFields(row);
+
+//       if (!name) {
+//         results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
+//         jobs[jobId].errors++;
+//         jobs[jobId].processed++;
+//         return;
+//       }
+
+//       const t0 = Date.now();
+//       try {
+//         const localPage = getPage();
+//         const result = await performSearch(name, city || undefined, localPage);
+//         const responseTime = Date.now() - t0;
+
+//         results[index] = { input: { idClients, name, city }, result, responseTime };
+
+//         if (result.Status === "Found") jobs[jobId].found++;
+//         else jobs[jobId].notFound++;
+
+//       } catch (err) {
+//         console.error(`❌ Job ${jobId} crashed:`, err.message);
+//     jobs[jobId].status = "error";
+//     jobs[jobId].error = err.message;
+//       } 
+//     })();
+//   });
+
+//     await Promise.all(subBatch);
+//       }
+
+//       saveProgress(results, i + batch.length);
+//       savePartialExcel(results);
+//     }
+
+//     // Retry failed rows
+//     for (const i of failedIndexes) {
+//       await performSearch(rows[i].name, rows[i].city, getPage());
+//     }
+
+//     // Save final Excel
+//     const wb = buildResultWorkbook(results);
+//     const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+//     const filePath = getNextResultFilename();
+//     fs.writeFileSync(filePath, buffer);
+
+//     jobs[jobId].status = "done";
+//     jobs[jobId].resultFile = filePath;
+//     jobs[jobId].summary = {
+//       total: rows.length,
+//       processed: jobs[jobId].processed,
+//       found: jobs[jobId].found,
+//       notFound: jobs[jobId].notFound,
+//       errors: jobs[jobId].errors
+//     };
+
+//   } catch (err) {
+//     console.error("Bulk search error:", err);
+//     jobs[jobId].status = "error";
+//     jobs[jobId].errors++;
+//   }
+//   })();
+// });
+
+// ✅ Status endpoint
 app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
@@ -1412,7 +1606,8 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
     notFound: 0,
     retries: 0,
     failedRows: [],
-    createdAt: new Date().toISOString()
+    createdAt: new Date().toISOString() // Add this line
+
   };
 
   res.json({ success: true, jobId, message: "Bulk job started" });
@@ -1623,14 +1818,13 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
     }
   })();
 });
-
 app.get("/api/bulk-status/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: "Job not found" });
   res.json(job);
 });
 
-// Download endpoint
+// ✅ Download endpoint
 app.get("/api/bulk-result/:jobId", (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.status(404).json({ error: "Job not found" });
@@ -1638,25 +1832,6 @@ app.get("/api/bulk-result/:jobId", (req, res) => {
   res.download(job.resultFile, path.basename(job.resultFile));
 });
 
-app.get("/api/bulk-jobs", (req, res) => {
-  const jobList = Object.entries(jobs).map(([id, job]) => ({
-    jobId: id,
-    status: job.status,
-    total: job.total,
-    processed: job.processed,
-    found: job.found,
-    notFound: job.notFound,
-    errors: job.errors,
-    retries: job.retries,
-    resultFile: job.resultFile,
-    error: job.error,
-    createdAt: job.createdAt
-  }));
-  
-  res.json({ jobs: jobList });
-});
-
-// Debug search endpoint
 app.post("/api/debug-search", async (req, res) => {
   const { name, city } = req.body;
  
@@ -1669,10 +1844,11 @@ app.post("/api/debug-search", async (req, res) => {
     return res.status(401).json({ error: "Not authenticated. Call /api/login first." });
   }
  
-  const log = [];
-  const warn = [];
+  const log = [];   // step-by-step trace
+  const warn = [];  // things that look wrong
  
   try {
+    // ── 1. Navigate & search ──────────────────────────────────────
     log.push("Navigating to charika.ma...");
     await page.goto("https://www.charika.ma/accueil", {
       waitUntil: "domcontentloaded",
@@ -1692,6 +1868,7 @@ app.post("/api/debug-search", async (req, res) => {
  
     log.push(`Search submitted for: "${name}"`);
  
+    // ── 2. Grab raw search results ────────────────────────────────
     const searchResults = await page.$$eval("div.text-soc", (items) =>
       items.map((item) => {
         const link = item.querySelector("h5 a");
@@ -1712,6 +1889,7 @@ app.post("/api/debug-search", async (req, res) => {
       return res.json({ log, warn, searchResults: [], detail: null });
     }
  
+    // Score and pick best match (mirrors performSearch logic)
     const companyClean = cleanName(name);
     const normalizedCity = city ? normalizeString(city) : null;
  
@@ -1729,28 +1907,60 @@ app.post("/api/debug-search", async (req, res) => {
     log.push(`Address from search listing: "${bestMatch.address || "(empty)"}"`);
  
     if (bestMatch.score < 0.8) {
-      warn.push(`Score ${bestMatch.score.toFixed(4)} is below 0.8 - would NOT be treated as Found`);
+      warn.push(`Score ${bestMatch.score.toFixed(4)} is below 0.8 — would NOT be treated as Found`);
     }
  
+    // ── 3. Navigate to company detail page ───────────────────────
     const detailUrl = `https://www.charika.ma/${bestMatch.href}`;
     log.push(`Navigating to detail page: ${detailUrl}`);
  
     await page.goto(detailUrl, { waitUntil: "domcontentloaded", timeout: 10000 });
  
+    // ── 4. Full DOM diagnostic on the detail page ─────────────────
     const domDiag = await page.evaluate(() => {
       const diag = {
         pageTitle:   document.title,
         h1Text:      document.querySelector("h1")?.innerText.trim() || null,
+ 
+        // ── Info table ──────────────────────────────────────────
         tableFound:  !!document.querySelector("div.col-md-7 table.informations-entreprise"),
         tableRows:   [],
+ 
+        // ── Alternative address selectors ───────────────────────
         altAddress1: Array.from(document.querySelectorAll(
           "div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label"
         )).map((l) => l.innerText.trim()),
+ 
         altAddress2: Array.from(document.querySelectorAll(
           "div.nopaddingleft label"
         )).map((l) => l.innerText.trim()),
+ 
         altAddress3: document.querySelector(".adresse, .address, [class*='adresse'], [class*='address']")
           ?.innerText.trim() || null,
+ 
+        // ── All visible text that contains typical address words ─
+        addressKeywordMatches: (() => {
+          const keywords = ["rue", "avenue", "bd", "boulevard", "lot", "km", "angle",
+                            "quartier", "hay", "zone", "résidence", "immeuble", "n°",
+                            "casablanca", "rabat", "marrakech", "fès", "agadir"];
+          const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+          const hits = [];
+          let node;
+          while ((node = walker.nextNode())) {
+            const txt = node.textContent.trim();
+            if (txt.length > 10 && keywords.some((k) => txt.toLowerCase().includes(k))) {
+              hits.push(txt.substring(0, 200));
+            }
+          }
+          // Deduplicate
+          return [...new Set(hits)].slice(0, 20);
+        })(),
+ 
+        // ── Raw HTML of the info table for inspection ───────────
+        tableHtml: document.querySelector("div.col-md-7 table.informations-entreprise")
+          ?.innerHTML.replace(/\s+/g, " ").trim().substring(0, 3000) || null,
+ 
+        // ── All <td> pairs in the table ─────────────────────────
         allTdPairs: (() => {
           const table = document.querySelector("div.col-md-7 table.informations-entreprise");
           if (!table) return [];
@@ -1763,9 +1973,55 @@ app.post("/api/debug-search", async (req, res) => {
           });
         })(),
       };
+ 
       return diag;
     });
  
+    // ── 5. Analyse the diagnostic ─────────────────────────────────
+    if (!domDiag.tableFound) {
+      warn.push("INFO TABLE NOT FOUND — selector 'div.col-md-7 table.informations-entreprise' matched nothing");
+    } else {
+      log.push(`Info table found — ${domDiag.allTdPairs.length} row(s)`);
+    }
+ 
+    const adresseRow = domDiag.allTdPairs.find(
+      (p) => p.field.includes("Adresse") || p.field.includes("adresse")
+    );
+ 
+    if (adresseRow) {
+      log.push(`Adresse row found in table: field="${adresseRow.field}" value="${adresseRow.value}"`);
+      if (!adresseRow.value) {
+        warn.push("Adresse row EXISTS but its value cell is EMPTY");
+      }
+    } else {
+      warn.push("No row with 'Adresse' found inside the info table");
+    }
+ 
+    if (domDiag.altAddress1.length) {
+      log.push(`Alt selector 1 (col-md-8 label) found: ${JSON.stringify(domDiag.altAddress1)}`);
+    } else {
+      warn.push("Alt selector 1 (div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label) → no matches");
+    }
+ 
+    if (domDiag.altAddress2.length) {
+      log.push(`Alt selector 2 (div.nopaddingleft label) found: ${JSON.stringify(domDiag.altAddress2)}`);
+    } else {
+      warn.push("Alt selector 2 (div.nopaddingleft label) → no matches");
+    }
+ 
+    if (domDiag.altAddress3) {
+      log.push(`Alt selector 3 ([class*=adresse]) found: "${domDiag.altAddress3}"`);
+    } else {
+      warn.push("Alt selector 3 ([class*=adresse/address]) → no match");
+    }
+ 
+    if (domDiag.addressKeywordMatches.length) {
+      log.push(`Address keyword scan found ${domDiag.addressKeywordMatches.length} text node(s) that look like addresses`);
+    } else {
+      warn.push("Address keyword scan found NOTHING that looks like an address on this page");
+    }
+ 
+    // ── 6. Return full report ─────────────────────────────────────
     return res.json({
       input:           { name, city: city || null },
       bestMatch:       { name: bestMatch.name, href: bestMatch.href, score: bestMatch.score, addressFromListing: bestMatch.address },
@@ -1781,6 +2037,24 @@ app.post("/api/debug-search", async (req, res) => {
     return res.status(500).json({ log, warn, error: err.message });
   }
 });
+app.get("/api/bulk-jobs", (req, res) => {
+  const jobList = Object.entries(jobs).map(([id, job]) => ({
+    jobId: id,
+    status: job.status,
+    total: job.total,
+    processed: job.processed,
+    found: job.found,
+    notFound: job.notFound,
+    errors: job.errors,
+    retries: job.retries,
+    resultFile: job.resultFile,
+    error: job.error,
+    createdAt: job.createdAt
+  }));
+  
+  res.json({ jobs: jobList });
+});
+
 
 // Clean up idle browser
 setInterval(async () => {
