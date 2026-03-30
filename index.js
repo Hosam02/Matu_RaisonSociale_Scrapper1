@@ -859,7 +859,7 @@ async function performSearch(companyName, city, page) {
   }
   
   // Step 2: if no good match, try variants
-  if (bestMatch.score < 0.92 && results.length > 0) {
+  if (bestMatch.score < 0.85 && results.length > 0) {
     const variants = generateSearchVariants(originalName);
     
     // 🔥 CRITICAL FIX: Add special variants for names with dots like "K.J"
