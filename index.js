@@ -69,12 +69,23 @@ function getPage() {
   return p;
 }
 
+// function normalizeString(str) {
+//   return str
+//     ?.normalize("NFD")
+//     .replace(/[\u0300-\u036f]/g, "")
+//     .toUpperCase()
+//     .trim() || "";
+// }
 function normalizeString(str) {
-  return str
-    ?.normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .toUpperCase()
-    .trim() || "";
+  return (
+    str
+      ?.normalize("NFD")                  // remove accents
+      .replace(/[\u0300-\u036f]/g, "")    // remove diacritics
+      .replace(/[^A-Z0-9\s]/gi, " ")      // remove punctuation, keep letters/numbers/spaces
+      .replace(/\s+/g, " ")               // normalize spaces
+      .toUpperCase()
+      .trim() || ""
+  );
 }
 
 // function cleanName(name) {
@@ -830,11 +841,225 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// IMPROVED performSearch() function with better handling for names like "STE K.J TRANS SARL"
+// // Check if city tokens match the address
+// function cityMatches(address, city) {
+//   if (!city) return true;
+//   const normalizedAddress = normalizeString(address);
+//   const tokens = normalizeString(city).split(" ");
+//   return tokens.every(t => normalizedAddress.includes(t));
+// }
+
+// async function performSearch(companyName, city, page) {
+//   const normalizedCity = city ? normalizeString(city) : null;
+
+//   // Recovery guard: wait for any in-flight navigation
+//   try {
+//     await page.waitForLoadState("domcontentloaded", { timeout: 5000 });
+//   } catch {
+//     await page.goto("https://www.charika.ma/accueil", {
+//       waitUntil: "domcontentloaded",
+//       timeout: 15000,
+//     });
+//   }
+
+//   const originalName = companyName;
+//   const cleanedOriginal = cleanName(originalName);
+
+//   // Step 1: search original name
+//   let { results, bestMatch } = await safeRunSearch(page, originalName, normalizedCity);
+//   let usedQuery = originalName;
+
+//   console.log(`🔍 Search for "${originalName}" found ${results.length} results`);
+//   if (bestMatch.name) console.log(`📊 Best match: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
+
+//   // Step 2: try variants if needed
+//   if (bestMatch.score < 0.85 && results.length > 0) {
+//     const variants = generateSearchVariants(originalName);
+//     const cleanWithoutDots = cleanedOriginal.replace(/\./g, '');
+//     const specialVariants = [
+//       cleanWithoutDots,
+//       cleanedOriginal.replace(/\s+/g, ''),
+//       cleanWithoutDots.replace(/\s+/g, ''),
+//       cleanedOriginal.replace(/\./g, ' ').replace(/\s+/g, ' ').trim()
+//     ];
+//     specialVariants.forEach(v => { if (v) variants.push(v); });
+
+//     const uniqueVariants = [...new Set(variants)];
+//     for (const variant of uniqueVariants) {
+//       console.log(`  🔄 Retrying with variant: "${variant}"`);
+//       const attempt = await safeRunSearch(page, variant, normalizedCity);
+//       if (attempt.bestMatch.score > bestMatch.score) {
+//         bestMatch = attempt.bestMatch;
+//         results = attempt.results;
+//         usedQuery = variant;
+//         console.log(`  ✅ Better match: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
+//       }
+//       if (bestMatch.score >= 0.93) break;
+//     }
+//   }
+
+//   // Step 3: try exact match by cleaning
+//   if (bestMatch.score < 0.85 && results.length > 0) {
+//     const exactMatch = results.find(r => {
+//       const cleanedResult = cleanName(r.name);
+//       const cleanedOriginalClean = cleanName(originalName);
+//       return [
+//         cleanedResult === cleanedOriginalClean,
+//         cleanedResult.replace(/\./g, '') === cleanedOriginalClean.replace(/\./g, ''),
+//         cleanedResult.replace(/\s+/g, '') === cleanedOriginalClean.replace(/\s+/g, ''),
+//         cleanedResult.includes(cleanedOriginalClean) || cleanedOriginalClean.includes(cleanedResult)
+//       ].some(Boolean);
+//     });
+//     if (exactMatch) {
+//       console.log(`  🎯 Exact match found: "${exactMatch.name}"`);
+//       bestMatch = {
+//         index: results.indexOf(exactMatch),
+//         score: 0.98,
+//         name: exactMatch.name,
+//         href: exactMatch.href,
+//         address: exactMatch.address
+//       };
+//     }
+//   }
+
+//   if (results.length === 0) {
+//     return {
+//       InputRaisonSociale: originalName,
+//       Status: "Not Found",
+//       Message: "No results found."
+//     };
+//   }
+
+//   // Step 4: fetch best match details
+//   if (bestMatch.score >= 0.85 && bestMatch.index !== -1) {
+//     await page.goto(`https://www.charika.ma/${bestMatch.href}`, {
+//       waitUntil: "domcontentloaded",
+//       timeout: 10000,
+//     });
+
+//     const info = await page.evaluate(
+//       ({ companyName, foundName, bestScore, usedQuery }) => {
+//         const result = {
+//           InputRaisonSociale: companyName,
+//           FoundRaisonSociale: foundName,
+//           Status: "Found",
+//           MatchScore: bestScore,
+//           IsExactMatch: bestScore >= 0.95,
+//           UsedQuery: usedQuery,
+//         };
+
+//         const table = document.querySelector("div.col-md-7 table.informations-entreprise");
+//         if (table) {
+//           table.querySelectorAll("tbody tr").forEach(row => {
+//             const cells = row.querySelectorAll("td");
+//             if (cells.length < 2) return;
+//             const field = cells[0].innerText.trim();
+//             const value = cells[1].innerText.trim();
+//             if (field.includes("RC") || field.includes("Registre")) {
+//               const m = value.match(/^(\d+)\s*\((.+)\)$/);
+//               result.RCNumber = m ? m[1] : value;
+//               result.RCTribunal = m ? m[2] : null;
+//             } else if (field.includes("ICE")) result.ICE = value;
+//             else if (field.includes("Forme juridique")) result.FormeJuridique = value;
+//             else if (field.includes("Capital")) result.Capital = value;
+//             else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
+//             else if (field.includes("Adresse")) result.Address = value;
+//             else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
+//             else if (field.includes("Fax")) result.Fax = value;
+//             else if (field.includes("Email")) result.Email = value;
+//             else if (field.includes("Site web")) result.SiteWeb = value;
+//             else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
+//           });
+//         }
+
+//         if (!result.Address) {
+//           const labels = Array.from(document.querySelectorAll("div.col-md-8.col-sm-8-col-xs-8.nopaddingleft label")).map(l => l.innerText.trim());
+//           if (labels.length) result.Address = labels.join(" ");
+//         }
+
+//         return result;
+//       },
+//       { companyName: originalName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
+//     );
+//       if (!info.Address) info.Address = bestMatch.address || "";
+//     // ✅ Check city using improved method
+//     if (!cityMatches(info.Address, city)) {
+//       console.log(`❌ City mismatch: expected "${city}" but got "${info.Address}"`);
+//       return {
+//         InputRaisonSociale: originalName,
+//         InputCity: city,
+//         Status: "Not Found - City Mismatch",
+//         Message: `Best match found (${bestMatch.name}) but city does not match.`,
+//         BestMatchScore: bestMatch.score,
+//         FoundRaisonSociale: bestMatch.name,
+//       };
+//     }
+
+//     console.log(`✅ Successfully found: "${bestMatch.name}"`);
+//     return info;
+//   }
+
+//   // Step 5: fallback recommendations
+//   console.log(`⚠️ No good match found, returning top results`);
+//   const topResults = results.filter(r => similarity(originalName, r.name) > 0.5).slice(0, 3);
+//   const recommendations = [];
+
+//   for (const result of topResults) {
+//     await page.goto(`https://www.charika.ma/${result.href}`, { waitUntil: "domcontentloaded", timeout: 10000 });
+//     const details = await page.evaluate(() => {
+//       const res = {};
+//       const table = document.querySelector("div.col-md-7 table.informations-entreprise");
+//       if (table) {
+//         table.querySelectorAll("tbody tr").forEach(row => {
+//           const cells = row.querySelectorAll("td");
+//           if (cells.length < 2) return;
+//           const field = cells[0].innerText.trim();
+//           const value = cells[1].innerText.trim();
+//           res[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
+//         });
+//       }
+//       return res;
+//     });
+//     const score = similarity(originalName, result.name);
+//     const cityMatch = cityMatches(result.address, city);
+//     recommendations.push({
+//       name: result.name,
+//       url: `https://www.charika.ma/${result.href}`,
+//       position: topResults.indexOf(result) + 1,
+//       matchScore: score,
+//       cityMatches: cityMatch,
+//       details: { ...details, adresse_complete: result.address }
+//     });
+//     await page.waitForTimeout(300);
+//   }
+
+//   return {
+//     InputRaisonSociale: originalName,
+//     InputCity: city || null,
+//     Status: "Not Found - Showing Search Results",
+//     Message: `No exact match found. Showing top ${recommendations.length} results.`,
+//     BestMatchScore: bestMatch.score,
+//     TotalResultsFound: results.length,
+//     Recommendations: recommendations
+//   };
+// }
+
+// Helper: city matching including RCTribunal fallback
+function cityMatches(address, city, rcTribunal = null) {
+  if (!city) return true;
+  const normalizedCity = normalizeString(city);
+  const normalizedAddress = normalizeString(address || "");
+  const normalizedRC = rcTribunal ? normalizeString(rcTribunal) : "";
+  
+  const tokens = normalizedCity.split(" ");
+  
+  // City matches if all tokens are in address OR in RCTribunal
+  return tokens.every(t => normalizedAddress.includes(t) || normalizedRC.includes(t));
+}
+
 async function performSearch(companyName, city, page) {
   const normalizedCity = city ? normalizeString(city) : null;
-  
-  // Recovery guard: wait for any in-flight navigation to settle
+
   try {
     await page.waitForLoadState("domcontentloaded", { timeout: 5000 });
   } catch {
@@ -843,254 +1068,187 @@ async function performSearch(companyName, city, page) {
       timeout: 15000,
     });
   }
-  
-  // Store original name for logging
+
   const originalName = companyName;
   const cleanedOriginal = cleanName(originalName);
-  
-  // Step 1: try original name
+
   let { results, bestMatch } = await safeRunSearch(page, originalName, normalizedCity);
   let usedQuery = originalName;
-  
-  // Log initial search results
-  console.log(`🔍 Search for "${originalName}" (cleaned: "${cleanedOriginal}") found ${results.length} results`);
-  if (bestMatch.name) {
-    console.log(`📊 Best match: "${bestMatch.name}" with score ${bestMatch.score.toFixed(4)}`);
-  }
-  
-  // Step 2: if no good match, try variants
+
+  // Step 2: try variants if needed (unchanged)
   if (bestMatch.score < 0.85 && results.length > 0) {
     const variants = generateSearchVariants(originalName);
-    
-    // 🔥 CRITICAL FIX: Add special variants for names with dots like "K.J"
     const cleanWithoutDots = cleanedOriginal.replace(/\./g, '');
     const specialVariants = [
-      cleanWithoutDots,                                    // "KJ TRANS"
-      cleanedOriginal.replace(/\s+/g, ''),                 // "KJTRANS"
-      cleanWithoutDots.replace(/\s+/g, ''),                // "KJTRANS"
-      cleanedOriginal.replace(/\./g, ' ').replace(/\s+/g, ' ').trim(), // "KJ TRANS" (clean)
+      cleanWithoutDots,
+      cleanedOriginal.replace(/\s+/g, ''),
+      cleanWithoutDots.replace(/\s+/g, ''),
+      cleanedOriginal.replace(/\./g, ' ').replace(/\s+/g, ' ').trim()
     ];
-    
-    // Add all special variants
-    specialVariants.forEach(v => {
-      if (v && v.length > 0) variants.push(v);
-    });
-    
-    // Remove duplicates
+    specialVariants.forEach(v => { if (v) variants.push(v); });
     const uniqueVariants = [...new Set(variants)];
-    
+
     for (const variant of uniqueVariants) {
       console.log(`  🔄 Retrying with variant: "${variant}"`);
       const attempt = await safeRunSearch(page, variant, normalizedCity);
-      
       if (attempt.bestMatch.score > bestMatch.score) {
         bestMatch = attempt.bestMatch;
-        results   = attempt.results;
+        results = attempt.results;
         usedQuery = variant;
-        console.log(`  ✅ Better match found: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
+        console.log(`  ✅ Better match: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
       }
-      
-      if (bestMatch.score >= 0.93) {
-        console.log(`  🎯 Variant matched: "${variant}" score=${bestMatch.score.toFixed(4)}`);
-        break;
-      }
+      if (bestMatch.score >= 0.93) break;
     }
   }
-  
-  // Step 3: If score is still low but we have results, try direct URL matching
+
+  // Step 3: exact match by cleaning (unchanged)
   if (bestMatch.score < 0.85 && results.length > 0) {
-    console.log(`  🔍 Attempting exact match after cleaning...`);
-    
-    // Try to find a result where the cleaned name matches exactly
     const exactMatch = results.find(r => {
       const cleanedResult = cleanName(r.name);
       const cleanedOriginalClean = cleanName(originalName);
-      
-      // Check multiple matching strategies
-      const exactMatchAfterClean = cleanedResult === cleanedOriginalClean;
-      const matchWithoutDots = cleanedResult.replace(/\./g, '') === cleanedOriginalClean.replace(/\./g, '');
-      const matchWithoutSpaces = cleanedResult.replace(/\s+/g, '') === cleanedOriginalClean.replace(/\s+/g, '');
-      const matchPartial = cleanedResult.includes(cleanedOriginalClean) || cleanedOriginalClean.includes(cleanedResult);
-      
-      if (exactMatchAfterClean || matchWithoutDots || matchWithoutSpaces || matchPartial) {
-        console.log(`  🎯 Found match via cleaning: "${r.name}" matches "${originalName}"`);
-        return true;
-      }
-      return false;
+      return [
+        cleanedResult === cleanedOriginalClean,
+        cleanedResult.replace(/\./g, '') === cleanedOriginalClean.replace(/\./g, ''),
+        cleanedResult.replace(/\s+/g, '') === cleanedOriginalClean.replace(/\s+/g, ''),
+        cleanedResult.includes(cleanedOriginalClean) || cleanedOriginalClean.includes(cleanedResult)
+      ].some(Boolean);
     });
-    
     if (exactMatch) {
-      console.log(`  ✅ Exact match found by cleaning: "${exactMatch.name}"`);
+      console.log(`  🎯 Exact match found: "${exactMatch.name}"`);
       bestMatch = {
         index: results.indexOf(exactMatch),
-        score: 0.98, // High score for exact match after cleaning
+        score: 0.98,
         name: exactMatch.name,
         href: exactMatch.href,
-        address: exactMatch.address
+        address: exactMatch.address,
+        RCTribunal: exactMatch.RCTribunal || null
       };
     }
   }
-  
-  // Step 4: still nothing at all
+
   if (results.length === 0) {
     return {
       InputRaisonSociale: originalName,
       Status: "Not Found",
-      Message: "No results found (including all space-split variants).",
+      Message: "No results found."
     };
   }
-  
-  // Step 5: good match -- fetch detail page (lowered threshold to 0.85 from 0.95)
+
+  // Step 4: fetch best match details
   if (bestMatch.score >= 0.85 && bestMatch.index !== -1) {
     await page.goto(`https://www.charika.ma/${bestMatch.href}`, {
       waitUntil: "domcontentloaded",
       timeout: 10000,
     });
-    
+
     const info = await page.evaluate(
       ({ companyName, foundName, bestScore, usedQuery }) => {
         const result = {
           InputRaisonSociale: companyName,
           FoundRaisonSociale: foundName,
-          Status:             "Found",
-          MatchScore:         bestScore,
-          IsExactMatch:       bestScore >= 0.95,
-          UsedQuery:          usedQuery,
+          Status: "Found",
+          MatchScore: bestScore,
+          IsExactMatch: bestScore >= 0.95,
+          UsedQuery: usedQuery,
         };
-        
+
         const table = document.querySelector("div.col-md-7 table.informations-entreprise");
         if (table) {
-          table.querySelectorAll("tbody tr").forEach((row) => {
+          table.querySelectorAll("tbody tr").forEach(row => {
             const cells = row.querySelectorAll("td");
             if (cells.length < 2) return;
             const field = cells[0].innerText.trim();
             const value = cells[1].innerText.trim();
             if (field.includes("RC") || field.includes("Registre")) {
               const m = value.match(/^(\d+)\s*\((.+)\)$/);
-              result.RCNumber   = m ? m[1] : value;
+              result.RCNumber = m ? m[1] : value;
               result.RCTribunal = m ? m[2] : null;
-            }
-            else if (field.includes("ICE"))             result.ICE            = value;
+            } else if (field.includes("ICE")) result.ICE = value;
             else if (field.includes("Forme juridique")) result.FormeJuridique = value;
-            else if (field.includes("Capital"))         result.Capital        = value;
+            else if (field.includes("Capital")) result.Capital = value;
             else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
-            else if (field.includes("Adresse"))         result.Address        = value;
+            else if (field.includes("Adresse")) result.Address = value;
             else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
-            else if (field.includes("Fax"))             result.Fax            = value;
-            else if (field.includes("Email"))           result.Email          = value;
-            else if (field.includes("Site web"))        result.SiteWeb        = value;
-            else result[field] = value;
+            else if (field.includes("Fax")) result.Fax = value;
+            else if (field.includes("Email")) result.Email = value;
+            else if (field.includes("Site web")) result.SiteWeb = value;
+            else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
           });
         }
-        
+
+        if (!result.Address) {
+          const labels = Array.from(document.querySelectorAll("div.col-md-8.col-sm-8-col-xs-8.nopaddingleft label")).map(l => l.innerText.trim());
+          if (labels.length) result.Address = labels.join(" ");
+        }
+
         return result;
       },
       { companyName: originalName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
     );
-    
-    // Fallback address from search listing
+
     if (!info.Address) info.Address = bestMatch.address || "";
-    
-    if (normalizedCity && info.Address) {
-      info.CityMatches = normalizeString(info.Address).includes(normalizedCity);
+
+    // ✅ City match using address OR RCTribunal
+    if (!cityMatches(info.Address, city, info.RCTribunal)) {
+      console.log(`❌ City mismatch: expected "${city}" but got "${info.Address}" (RCTribunal: ${info.RCTribunal || "N/A"})`);
+      return {
+        InputRaisonSociale: originalName,
+        InputCity: city,
+        Status: "Not Found - City Mismatch",
+        Message: `Best match found (${bestMatch.name}) but city does not match.`,
+        BestMatchScore: bestMatch.score,
+        FoundRaisonSociale: bestMatch.name,
+      };
     }
-    
-    console.log(`✅ Successfully found: "${bestMatch.name}" (score: ${bestMatch.score.toFixed(4)})`);
-    
+
+    console.log(`✅ Successfully found: "${bestMatch.name}"`);
     return info;
   }
-  
-  // Step 6: no good match -- return top 3 recommendations
-  console.log(`⚠️ No good match found, returning top ${Math.min(3, results.length)} recommendations`);
-  
-  const topResults = results
-    .filter(r => similarity(originalName, r.name) > 0.5)
-    .slice(0, 3);
+
+  // Step 5: fallback recommendations (unchanged)
+  console.log(`⚠️ No good match found, returning top results`);
+  const topResults = results.filter(r => similarity(originalName, r.name) > 0.5).slice(0, 3);
   const recommendations = [];
-  
+
   for (const result of topResults) {
-    console.log(`📄 Fetching details for: ${result.name}`);
-    
-    await page.goto(`https://www.charika.ma/${result.href}`, {
-      waitUntil: "domcontentloaded",
-      timeout: 10000,
-    });
-    
+    await page.goto(`https://www.charika.ma/${result.href}`, { waitUntil: "domcontentloaded", timeout: 10000 });
     const details = await page.evaluate(() => {
-      const result = {};
-      const titleElement = document.querySelector("h1");
-      if (titleElement) result.NomCommercial = titleElement.innerText.trim();
-      
+      const res = {};
       const table = document.querySelector("div.col-md-7 table.informations-entreprise");
       if (table) {
-        table.querySelectorAll("tbody tr").forEach((row) => {
+        table.querySelectorAll("tbody tr").forEach(row => {
           const cells = row.querySelectorAll("td");
           if (cells.length < 2) return;
           const field = cells[0].innerText.trim();
           const value = cells[1].innerText.trim();
-          if (field.includes("RC") || field.includes("Registre")) {
-            const m = value.match(/^(\d+)\s*\((.+)\)$/);
-            result.RCNumber   = m ? m[1] : value;
-            result.RCTribunal = m ? m[2] : null;
-          }
-          else if (field.includes("ICE"))             result.ICE            = value;
-          else if (field.includes("Forme juridique")) result.FormeJuridique = value;
-          else if (field.includes("Capital"))         result.Capital        = value;
-          else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
-          else if (field.includes("Adresse"))         result.Adresse        = value;
-          else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
-          else if (field.includes("Fax"))             result.Fax            = value;
-          else if (field.includes("Email"))           result.Email          = value;
-          else if (field.includes("Site web"))        result.SiteWeb        = value;
-          else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
+          res[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
         });
       }
-      
-      if (!result.Adresse) {
-        const labels = Array.from(document.querySelectorAll(
-          "div.col-md-8.col-sm-8.col-xs-8.nopaddingleft label"
-        )).map((l) => l.innerText.trim());
-        if (labels.length) result.Adresse = labels.join(" ");
-      }
-      
-      return result;
+      return res;
     });
-    
-    const score       = similarity(originalName, result.name);
-    const cityMatches = !normalizedCity || normalizeString(result.address).includes(normalizedCity);
-    
+    const score = similarity(originalName, result.name);
+    const cityMatchFlag = cityMatches(result.address, city, result.RCTribunal);
     recommendations.push({
-      name:       result.name,
-      url:        `https://www.charika.ma/${result.href}`,
-      position:   topResults.indexOf(result) + 1,
+      name: result.name,
+      url: `https://www.charika.ma/${result.href}`,
+      position: topResults.indexOf(result) + 1,
       matchScore: score,
-      cityMatches,
-      details: { ...details, adresse_complete: result.address },
+      cityMatches: cityMatchFlag,
+      details: { ...details, adresse_complete: result.address }
     });
-    
     await page.waitForTimeout(300);
   }
-  
-  const variantCount = generateSearchVariants(originalName).length;
-  let message = `No exact match found (best score: ${bestMatch.score.toFixed(2)}, tried ${1 + variantCount} query variant(s)). Showing top ${topResults.length} results.`;
-  if (normalizedCity) {
-    const cityMatchCount = recommendations.filter((r) => r.cityMatches).length;
-    message += cityMatchCount > 0
-      ? ` ${cityMatchCount} result(s) from ${city}.`
-      : ` None from ${city}.`;
-  }
-  
+
   return {
     InputRaisonSociale: originalName,
-    InputCity:          city || null,
-    Status:             "Not Found - Showing Search Results",
-    Message:            message,
-    BestMatchScore:     bestMatch.score,
-    TotalResultsFound:  results.length,
-    Recommendations:    recommendations,
+    InputCity: city || null,
+    Status: "Not Found - Showing Search Results",
+    Message: `No exact match found. Showing top ${recommendations.length} results.`,
+    BestMatchScore: bestMatch.score,
+    TotalResultsFound: results.length,
+    Recommendations: recommendations
   };
 }
-
 // ── Multer: store upload in memory (no temp files on disk) ──────────
 const upload = multer({
   storage: multer.memoryStorage(),
