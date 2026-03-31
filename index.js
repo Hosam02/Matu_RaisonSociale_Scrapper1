@@ -1381,7 +1381,250 @@ app.post("/api/ice", async (req, res) => {
 // Bulk search jobs storage
 const jobs = {};
 
-// Bulk search endpoint with improved session management
+// // Bulk search endpoint with improved session management
+// app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
+//   if (!req.file) {
+//     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
+//   }
+
+//   let rows;
+//   try {
+//     const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+//     const ws = wb.Sheets[wb.SheetNames[0]];
+//     rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+//   } catch {
+//     return res.status(400).json({ success: false, error: "Invalid Excel file." });
+//   }
+
+//   if (!rows.length) {
+//     return res.status(400).json({ success: false, error: "Empty file." });
+//   }
+
+//   const jobId = uuidv4();
+//   jobs[jobId] = {
+//     status: "running",
+//     processed: 0,
+//     total: rows.length,
+//     summary: null,
+//     resultFile: null,
+//     errors: 0,
+//     found: 0,
+//     notFound: 0,
+//     retries: 0,
+//     failedRows: [],
+//     createdAt: new Date().toISOString()
+//   };
+
+//   res.json({ success: true, jobId, message: "Bulk job started" });
+
+//   // Background processing
+//   (async () => {
+//     try {
+//       const { startIndex, results } = loadProgress(rows.length);
+//       const concurrency = Math.min(parseInt(req.query.concurrency || "2"), 3);
+//       const MAX_RETRIES = 3;
+      
+//       // Track rows that need retry
+//       const retryQueue = [];
+
+//       for (let i = startIndex; i < rows.length; i += BATCH_SIZE) {
+//         const batch = rows.slice(i, i + BATCH_SIZE);
+
+//         // Ensure fresh session before each batch
+//         let sessionValid = await ensureFreshSession();
+//         if (!sessionValid) {
+//           console.log(`⚠️ Job ${jobId}: Session invalid, reinitializing browser...`);
+//           await initializeBrowserAndLogin();
+//           await new Promise(r => setTimeout(r, 2000));
+//         }
+
+//         for (let j = 0; j < batch.length; j += concurrency) {
+//           const subBatch = batch.slice(j, j + concurrency);
+          
+//           const batchPromises = subBatch.map(async (row, k) => {
+//             const index = i + j + k;
+//             let retries = 0;
+            
+//             const processWithRetry = async () => {
+//               const { idClients, name, city } = extractRowFields(row);
+
+//               if (!name) {
+//                 results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
+//                 jobs[jobId].errors++;
+//                 jobs[jobId].processed++;
+//                 return;
+//               }
+
+//               const t0 = Date.now();
+//               try {
+//                 // Check session before each search
+//                 const isLoggedIn = await ensureLoggedIn();
+//                 if (!isLoggedIn) {
+//                   console.log(`🔄 Job ${jobId}: Session lost, reconnecting...`);
+//                   await initializeBrowserAndLogin();
+//                   await new Promise(r => setTimeout(r, 1000));
+//                 }
+
+//                 const localPage = getPage();
+//                 const result = await performSearch(name, city || undefined, localPage);
+//                 const responseTime = Date.now() - t0;
+
+//                 results[index] = { input: { idClients, name, city }, result, responseTime };
+
+//                 if (result.Status === "Found") jobs[jobId].found++;
+//                 else jobs[jobId].notFound++;
+
+//                 jobs[jobId].processed++;
+                
+//                 // Save progress after each successful row
+//                 saveProgress(results, index);
+                
+//               } catch (err) {
+//                 console.error(`❌ Job ${jobId} - Row ${index + 1} failed:`, err.message);
+                
+//                 // Check if it's a session/auth error
+//                 const isSessionError = err.message.toLowerCase().includes('session') || 
+//                                       err.message.toLowerCase().includes('login') ||
+//                                       err.message.toLowerCase().includes('authenticated');
+                
+//                 if (isSessionError && retries < MAX_RETRIES) {
+//                   retries++;
+//                   jobs[jobId].retries++;
+//                   console.log(`🔄 Retry ${retries}/${MAX_RETRIES} for row ${index + 1} (${name})`);
+                  
+//                   // Reinitialize session
+//                   await initializeBrowserAndLogin();
+//                   await new Promise(r => setTimeout(r, 2000));
+                  
+//                   // Retry this specific row
+//                   return processWithRetry();
+//                 } else {
+//                   // Failed after retries or non-session error
+//                   results[index] = {
+//                     input: { idClients, name, city },
+//                     error: err.message,
+//                     responseTime: Date.now() - t0,
+//                     retriesAttempted: retries
+//                   };
+//                   jobs[jobId].errors++;
+//                   jobs[jobId].processed++;
+                  
+//                   // Store failed row info for final retry phase
+//                   if (isSessionError && retries >= MAX_RETRIES) {
+//                     retryQueue.push({ index, row, retries });
+//                   }
+                  
+//                   saveProgress(results, index);
+//                 }
+//               }
+//             };
+            
+//             await processWithRetry();
+//           });
+          
+//           await Promise.all(batchPromises);
+//           await new Promise(r => setTimeout(r, 300)); // Small delay between batches
+//         }
+
+//         saveProgress(results, i + batch.length);
+//         savePartialExcel(results);
+        
+//         // Update job status periodically
+//         jobs[jobId].summary = {
+//           total: rows.length,
+//           processed: jobs[jobId].processed,
+//           found: jobs[jobId].found,
+//           notFound: jobs[jobId].notFound,
+//           errors: jobs[jobId].errors,
+//           retries: jobs[jobId].retries
+//         };
+//       }
+
+//       // Phase 2: Final retry for session-failed rows with fresh browser
+//       if (retryQueue.length > 0) {
+//         console.log(`🔁 Job ${jobId}: Final retry phase for ${retryQueue.length} session-failed rows...`);
+        
+//         // Force fresh browser instance
+//         if (browser) {
+//           await browser.close().catch(() => {});
+//           browser = null;
+//           page = null;
+//         }
+        
+//         await initializeBrowserAndLogin();
+//         await new Promise(r => setTimeout(r, 3000));
+        
+//         for (const { index, row } of retryQueue) {
+//           const { idClients, name, city } = extractRowFields(row);
+//           const t0 = Date.now();
+          
+//           try {
+//             const localPage = getPage();
+//             const result = await performSearch(name, city || undefined, localPage);
+//             const responseTime = Date.now() - t0;
+            
+//             results[index] = { input: { idClients, name, city }, result, responseTime };
+            
+//             if (result.Status === "Found") jobs[jobId].found++;
+//             else jobs[jobId].notFound++;
+            
+//             jobs[jobId].errors--; // Remove from error count
+//             jobs[jobId].processed++;
+            
+//             console.log(`✅ Row ${index + 1} recovered on final retry`);
+//             saveProgress(results, index);
+            
+//           } catch (err) {
+//             console.error(`❌ Final retry failed for row ${index + 1}:`, err.message);
+//             // Keep the existing error in results
+//           }
+          
+//           await new Promise(r => setTimeout(r, 500));
+//         }
+//       }
+
+//       // Save final Excel
+//       const wb = buildResultWorkbook(results);
+//       const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+//       const filePath = getNextResultFilename();
+//       fs.writeFileSync(filePath, buffer);
+
+//       jobs[jobId].status = "done";
+//       jobs[jobId].resultFile = filePath;
+//       jobs[jobId].summary = {
+//         total: rows.length,
+//         processed: jobs[jobId].processed,
+//         found: jobs[jobId].found,
+//         notFound: jobs[jobId].notFound,
+//         errors: jobs[jobId].errors,
+//         retries: jobs[jobId].retries,
+//         recoveredRows: retryQueue.length - (jobs[jobId].errors - (jobs[jobId].errors - retryQueue.length))
+//       };
+      
+//       // Clean up progress file after successful completion
+//       if (fs.existsSync(PROGRESS_FILE)) {
+//         fs.unlinkSync(PROGRESS_FILE);
+//         console.log(`🧹 Cleaned up progress file for job ${jobId}`);
+//       }
+      
+//       console.log(`✅ Job ${jobId} completed successfully`);
+
+//     } catch (err) {
+//       console.error(`💥 Job ${jobId} fatal error:`, err);
+//       jobs[jobId].status = "error";
+//       jobs[jobId].error = err.message;
+      
+//       // Save whatever we have before crashing
+//       try {
+//         savePartialExcel(jobs[jobId].results || []);
+//       } catch (saveErr) {
+//         console.error("Failed to save partial results:", saveErr);
+//       }
+//     }
+//   })();
+// });
+
+// Bulk search endpoint with background processing and top recommendation only
 app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
@@ -1415,6 +1658,7 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
     createdAt: new Date().toISOString()
   };
 
+  // Return immediately
   res.json({ success: true, jobId, message: "Bulk job started" });
 
   // Background processing
@@ -1423,31 +1667,23 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
       const { startIndex, results } = loadProgress(rows.length);
       const concurrency = Math.min(parseInt(req.query.concurrency || "2"), 3);
       const MAX_RETRIES = 3;
-      
-      // Track rows that need retry
       const retryQueue = [];
 
       for (let i = startIndex; i < rows.length; i += BATCH_SIZE) {
         const batch = rows.slice(i, i + BATCH_SIZE);
 
-        // Ensure fresh session before each batch
         let sessionValid = await ensureFreshSession();
-        if (!sessionValid) {
-          console.log(`⚠️ Job ${jobId}: Session invalid, reinitializing browser...`);
-          await initializeBrowserAndLogin();
-          await new Promise(r => setTimeout(r, 2000));
-        }
+        if (!sessionValid) await initializeBrowserAndLogin();
 
         for (let j = 0; j < batch.length; j += concurrency) {
           const subBatch = batch.slice(j, j + concurrency);
-          
-          const batchPromises = subBatch.map(async (row, k) => {
+
+          await Promise.all(subBatch.map(async (row, k) => {
             const index = i + j + k;
             let retries = 0;
-            
+
             const processWithRetry = async () => {
               const { idClients, name, city } = extractRowFields(row);
-
               if (!name) {
                 results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
                 jobs[jobId].errors++;
@@ -1457,49 +1693,39 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
 
               const t0 = Date.now();
               try {
-                // Check session before each search
                 const isLoggedIn = await ensureLoggedIn();
-                if (!isLoggedIn) {
-                  console.log(`🔄 Job ${jobId}: Session lost, reconnecting...`);
-                  await initializeBrowserAndLogin();
-                  await new Promise(r => setTimeout(r, 1000));
-                }
+                if (!isLoggedIn) await initializeBrowserAndLogin();
 
                 const localPage = getPage();
-                const result = await performSearch(name, city || undefined, localPage);
-                const responseTime = Date.now() - t0;
+                let result = await performSearch(name, city || undefined, localPage);
 
+                // Keep only the recommendation with the highest MatchScore
+                if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
+                  const best = result.Recommendations.reduce(
+                    (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+                    {}
+                  );
+                  result.Recommendations = [best];
+                }
+
+                const responseTime = Date.now() - t0;
                 results[index] = { input: { idClients, name, city }, result, responseTime };
 
                 if (result.Status === "Found") jobs[jobId].found++;
                 else jobs[jobId].notFound++;
 
                 jobs[jobId].processed++;
-                
-                // Save progress after each successful row
                 saveProgress(results, index);
-                
+
               } catch (err) {
-                console.error(`❌ Job ${jobId} - Row ${index + 1} failed:`, err.message);
-                
-                // Check if it's a session/auth error
-                const isSessionError = err.message.toLowerCase().includes('session') || 
-                                      err.message.toLowerCase().includes('login') ||
-                                      err.message.toLowerCase().includes('authenticated');
-                
+                const isSessionError = /session|login|authenticated/i.test(err.message);
                 if (isSessionError && retries < MAX_RETRIES) {
                   retries++;
                   jobs[jobId].retries++;
-                  console.log(`🔄 Retry ${retries}/${MAX_RETRIES} for row ${index + 1} (${name})`);
-                  
-                  // Reinitialize session
                   await initializeBrowserAndLogin();
                   await new Promise(r => setTimeout(r, 2000));
-                  
-                  // Retry this specific row
                   return processWithRetry();
                 } else {
-                  // Failed after retries or non-session error
                   results[index] = {
                     input: { idClients, name, city },
                     error: err.message,
@@ -1508,28 +1734,21 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
                   };
                   jobs[jobId].errors++;
                   jobs[jobId].processed++;
-                  
-                  // Store failed row info for final retry phase
-                  if (isSessionError && retries >= MAX_RETRIES) {
-                    retryQueue.push({ index, row, retries });
-                  }
-                  
+                  if (isSessionError && retries >= MAX_RETRIES) retryQueue.push({ index, row, retries });
                   saveProgress(results, index);
                 }
               }
             };
-            
+
             await processWithRetry();
-          });
-          
-          await Promise.all(batchPromises);
-          await new Promise(r => setTimeout(r, 300)); // Small delay between batches
+          }));
+
+          await new Promise(r => setTimeout(r, 300));
         }
 
         saveProgress(results, i + batch.length);
         savePartialExcel(results);
-        
-        // Update job status periodically
+
         jobs[jobId].summary = {
           total: rows.length,
           processed: jobs[jobId].processed,
@@ -1540,45 +1759,32 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
         };
       }
 
-      // Phase 2: Final retry for session-failed rows with fresh browser
+      // Final retry for session errors
       if (retryQueue.length > 0) {
-        console.log(`🔁 Job ${jobId}: Final retry phase for ${retryQueue.length} session-failed rows...`);
-        
-        // Force fresh browser instance
-        if (browser) {
-          await browser.close().catch(() => {});
-          browser = null;
-          page = null;
-        }
-        
+        if (browser) { await browser.close().catch(() => {}); browser = null; page = null; }
         await initializeBrowserAndLogin();
         await new Promise(r => setTimeout(r, 3000));
-        
+
         for (const { index, row } of retryQueue) {
           const { idClients, name, city } = extractRowFields(row);
           const t0 = Date.now();
-          
           try {
             const localPage = getPage();
-            const result = await performSearch(name, city || undefined, localPage);
-            const responseTime = Date.now() - t0;
-            
-            results[index] = { input: { idClients, name, city }, result, responseTime };
-            
+            let result = await performSearch(name, city || undefined, localPage);
+            if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
+              const best = result.Recommendations.reduce(
+                (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+                {}
+              );
+              result.Recommendations = [best];
+            }
+            results[index] = { input: { idClients, name, city }, result, responseTime: Date.now() - t0 };
             if (result.Status === "Found") jobs[jobId].found++;
             else jobs[jobId].notFound++;
-            
-            jobs[jobId].errors--; // Remove from error count
+            jobs[jobId].errors--;
             jobs[jobId].processed++;
-            
-            console.log(`✅ Row ${index + 1} recovered on final retry`);
             saveProgress(results, index);
-            
-          } catch (err) {
-            console.error(`❌ Final retry failed for row ${index + 1}:`, err.message);
-            // Keep the existing error in results
-          }
-          
+          } catch {}
           await new Promise(r => setTimeout(r, 500));
         }
       }
@@ -1597,29 +1803,19 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
         found: jobs[jobId].found,
         notFound: jobs[jobId].notFound,
         errors: jobs[jobId].errors,
-        retries: jobs[jobId].retries,
-        recoveredRows: retryQueue.length - (jobs[jobId].errors - (jobs[jobId].errors - retryQueue.length))
+        retries: jobs[jobId].retries
       };
-      
-      // Clean up progress file after successful completion
-      if (fs.existsSync(PROGRESS_FILE)) {
-        fs.unlinkSync(PROGRESS_FILE);
-        console.log(`🧹 Cleaned up progress file for job ${jobId}`);
-      }
-      
+
+      if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE);
       console.log(`✅ Job ${jobId} completed successfully`);
 
     } catch (err) {
       console.error(`💥 Job ${jobId} fatal error:`, err);
       jobs[jobId].status = "error";
       jobs[jobId].error = err.message;
-      
-      // Save whatever we have before crashing
-      try {
-        savePartialExcel(jobs[jobId].results || []);
-      } catch (saveErr) {
-        console.error("Failed to save partial results:", saveErr);
-      }
+
+      // Attempt to save partial results if possible
+      try { savePartialExcel(jobs[jobId].results || []); } catch {}
     }
   })();
 });
