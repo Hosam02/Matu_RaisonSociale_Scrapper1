@@ -14,6 +14,8 @@ import { v4 as uuidv4 } from "uuid";
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server, path: '/status' });
+// Bulk search jobs storage
+const jobs = {};
 
 app.use(express.json());
 
@@ -69,13 +71,6 @@ function getPage() {
   return p;
 }
 
-// function normalizeString(str) {
-//   return str
-//     ?.normalize("NFD")
-//     .replace(/[\u0300-\u036f]/g, "")
-//     .toUpperCase()
-//     .trim() || "";
-// }
 function normalizeString(str) {
   return (
     str
@@ -88,25 +83,7 @@ function normalizeString(str) {
   );
 }
 
-// function cleanName(name) {
-//   if (!name) return "";
 
-//   let cleaned = name
-//     .normalize("NFD")
-//     .replace(/[\u0300-\u036f]/g, "") // remove accents
-//     .toUpperCase()
-    
-//     // 🔥 normalize punctuation
-//     .replace(/[.\-_/]/g, " ")   // replace ., -, _, / with space
-//     .replace(/[^A-Z0-9\s]/g, "") // remove any other weird chars
-
-//   // remove legal noise
-//   for (const pattern of NOISE_PATTERNS) {
-//     cleaned = cleaned.replace(pattern, "");
-//   }
-
-//   return cleaned.replace(/\s+/g, " ").trim();
-// }
 function cleanName(name) {
   if (!name) return "";
 
@@ -395,9 +372,9 @@ async function extractCompanyDetails(page, url) {
   }
 }
 
-/* =======================
-   BROWSER MANAGER
-======================= */
+
+   //BROWSER MANAGER
+
 let browser = null;
 let page = null;
 let loginStatus = {
@@ -417,9 +394,9 @@ let lastUsed = Date.now();
 const BROWSER_IDLE_TIMEOUT = 30 * 60 * 1000; // 30 minutes
 const SESSION_REFRESH_INTERVAL = 25 * 60 * 1000; // Refresh session every 25 minutes
 
-/* =======================
-   WEBSOCKET STATUS BROADCAST
-======================= */
+
+  //WEBSOCKET STATUS BROADCAST
+
 
 function broadcastStatus(update = {}) {
   if (loginStatus.isLoggedIn && loginStatus.lastLoginAttempt) {
@@ -457,9 +434,9 @@ function updateLoginStatus(updates) {
   broadcastStatus();
 }
 
-/* =======================
-   WEBSOCKET CONNECTION HANDLER
-======================= */
+
+   //WEBSOCKET CONNECTION HANDLER
+
 
 wss.on('connection', (ws, req) => {
   const clientId = Date.now() + Math.random().toString(36).substring(7);
@@ -578,34 +555,7 @@ async function ensureFreshSession() {
   }
 }
 
-/* =======================
-   LOGIN ENDPOINT
-======================= */
-app.post("/api/login", async (req, res) => {
-  console.log("🔑 Login endpoint called");
-  
-  try {
-    updateLoginStatus({ status: 'connecting', error: null });
-    const result = await initializeBrowserAndLogin();
-    res.json(result);
-  } catch (error) {
-    console.error("Login failed:", error);
-    
-    updateLoginStatus({ 
-      isLoggedIn: false,
-      status: 'error',
-      lastLoginAttempt: new Date().toISOString(),
-      error: error.message,
-      sessionAge: null
-    });
-    
-    res.status(500).json({ 
-      success: false, 
-      error: error.message,
-      status: loginStatus
-    });
-  }
-});
+
 
 async function initializeBrowserAndLogin() {
   if (browser) {
@@ -715,9 +665,9 @@ async function verifyLogin() {
   }
 }
 
-/* =======================
-   SESSION MANAGEMENT
-======================= */
+
+  // SESSION MANAGEMENT
+
 async function ensureLoggedIn() {
   const now = Date.now();
   
@@ -786,263 +736,7 @@ function compactString(str) {
   return cleanName(str).replace(/\s+/g, "");
 }
 
-/* =======================
-   SEARCH ENDPOINT - WITH TOP 3 RECOMMENDATIONS
-======================= */
-app.post("/api/search", async (req, res) => {
-  const { name, city } = req.body;
-  
-  if (!name) {
-    return res.status(400).json({ 
-      error: "Company name is required",
-      InputRaisonSociale: null,
-      Status: "Error"
-    });
-  }
 
-  const startTime = Date.now();
-  
-  try {
-    const isLoggedIn = await ensureLoggedIn();
-    
-    if (!isLoggedIn || !page) {
-      return res.status(401).json({
-        InputRaisonSociale: name,
-        Status: "Not Authenticated",
-        ErrorMessage: "Please login first using /api/login endpoint",
-        ResponseTime: Date.now() - startTime
-      });
-    }
-    const localPage = getPage();
-    const result = await performSearch(name, city, localPage);
-    result.ResponseTime = Date.now() - startTime;
-    
-    res.json(result);
-    
-  } catch (error) {
-    console.error(`Search error for ${name}:`, error);
-    
-    if (error.message.includes('Session') || error.message.includes('login')) {
-      updateLoginStatus({ isLoggedIn: false, status: 'disconnected' });
-      return res.status(401).json({
-        InputRaisonSociale: name,
-        Status: "Session Expired",
-        ErrorMessage: "Session expired. Please login again.",
-        ResponseTime: Date.now() - startTime
-      });
-    }
-    
-    res.status(500).json({
-      InputRaisonSociale: name,
-      Status: "Error",
-      ErrorMessage: error.message,
-      ResponseTime: Date.now() - startTime
-    });
-  }
-});
-
-// // Check if city tokens match the address
-// function cityMatches(address, city) {
-//   if (!city) return true;
-//   const normalizedAddress = normalizeString(address);
-//   const tokens = normalizeString(city).split(" ");
-//   return tokens.every(t => normalizedAddress.includes(t));
-// }
-
-// async function performSearch(companyName, city, page) {
-//   const normalizedCity = city ? normalizeString(city) : null;
-
-//   // Recovery guard: wait for any in-flight navigation
-//   try {
-//     await page.waitForLoadState("domcontentloaded", { timeout: 5000 });
-//   } catch {
-//     await page.goto("https://www.charika.ma/accueil", {
-//       waitUntil: "domcontentloaded",
-//       timeout: 15000,
-//     });
-//   }
-
-//   const originalName = companyName;
-//   const cleanedOriginal = cleanName(originalName);
-
-//   // Step 1: search original name
-//   let { results, bestMatch } = await safeRunSearch(page, originalName, normalizedCity);
-//   let usedQuery = originalName;
-
-//   console.log(`🔍 Search for "${originalName}" found ${results.length} results`);
-//   if (bestMatch.name) console.log(`📊 Best match: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
-
-//   // Step 2: try variants if needed
-//   if (bestMatch.score < 0.85 && results.length > 0) {
-//     const variants = generateSearchVariants(originalName);
-//     const cleanWithoutDots = cleanedOriginal.replace(/\./g, '');
-//     const specialVariants = [
-//       cleanWithoutDots,
-//       cleanedOriginal.replace(/\s+/g, ''),
-//       cleanWithoutDots.replace(/\s+/g, ''),
-//       cleanedOriginal.replace(/\./g, ' ').replace(/\s+/g, ' ').trim()
-//     ];
-//     specialVariants.forEach(v => { if (v) variants.push(v); });
-
-//     const uniqueVariants = [...new Set(variants)];
-//     for (const variant of uniqueVariants) {
-//       console.log(`  🔄 Retrying with variant: "${variant}"`);
-//       const attempt = await safeRunSearch(page, variant, normalizedCity);
-//       if (attempt.bestMatch.score > bestMatch.score) {
-//         bestMatch = attempt.bestMatch;
-//         results = attempt.results;
-//         usedQuery = variant;
-//         console.log(`  ✅ Better match: "${bestMatch.name}" score=${bestMatch.score.toFixed(4)}`);
-//       }
-//       if (bestMatch.score >= 0.93) break;
-//     }
-//   }
-
-//   // Step 3: try exact match by cleaning
-//   if (bestMatch.score < 0.85 && results.length > 0) {
-//     const exactMatch = results.find(r => {
-//       const cleanedResult = cleanName(r.name);
-//       const cleanedOriginalClean = cleanName(originalName);
-//       return [
-//         cleanedResult === cleanedOriginalClean,
-//         cleanedResult.replace(/\./g, '') === cleanedOriginalClean.replace(/\./g, ''),
-//         cleanedResult.replace(/\s+/g, '') === cleanedOriginalClean.replace(/\s+/g, ''),
-//         cleanedResult.includes(cleanedOriginalClean) || cleanedOriginalClean.includes(cleanedResult)
-//       ].some(Boolean);
-//     });
-//     if (exactMatch) {
-//       console.log(`  🎯 Exact match found: "${exactMatch.name}"`);
-//       bestMatch = {
-//         index: results.indexOf(exactMatch),
-//         score: 0.98,
-//         name: exactMatch.name,
-//         href: exactMatch.href,
-//         address: exactMatch.address
-//       };
-//     }
-//   }
-
-//   if (results.length === 0) {
-//     return {
-//       InputRaisonSociale: originalName,
-//       Status: "Not Found",
-//       Message: "No results found."
-//     };
-//   }
-
-//   // Step 4: fetch best match details
-//   if (bestMatch.score >= 0.85 && bestMatch.index !== -1) {
-//     await page.goto(`https://www.charika.ma/${bestMatch.href}`, {
-//       waitUntil: "domcontentloaded",
-//       timeout: 10000,
-//     });
-
-//     const info = await page.evaluate(
-//       ({ companyName, foundName, bestScore, usedQuery }) => {
-//         const result = {
-//           InputRaisonSociale: companyName,
-//           FoundRaisonSociale: foundName,
-//           Status: "Found",
-//           MatchScore: bestScore,
-//           IsExactMatch: bestScore >= 0.95,
-//           UsedQuery: usedQuery,
-//         };
-
-//         const table = document.querySelector("div.col-md-7 table.informations-entreprise");
-//         if (table) {
-//           table.querySelectorAll("tbody tr").forEach(row => {
-//             const cells = row.querySelectorAll("td");
-//             if (cells.length < 2) return;
-//             const field = cells[0].innerText.trim();
-//             const value = cells[1].innerText.trim();
-//             if (field.includes("RC") || field.includes("Registre")) {
-//               const m = value.match(/^(\d+)\s*\((.+)\)$/);
-//               result.RCNumber = m ? m[1] : value;
-//               result.RCTribunal = m ? m[2] : null;
-//             } else if (field.includes("ICE")) result.ICE = value;
-//             else if (field.includes("Forme juridique")) result.FormeJuridique = value;
-//             else if (field.includes("Capital")) result.Capital = value;
-//             else if (field.includes("Activite") || field.includes("Activité")) result.Activite = value;
-//             else if (field.includes("Adresse")) result.Address = value;
-//             else if (field.includes("Tel") || field.includes("Tél")) result.Telephone = value;
-//             else if (field.includes("Fax")) result.Fax = value;
-//             else if (field.includes("Email")) result.Email = value;
-//             else if (field.includes("Site web")) result.SiteWeb = value;
-//             else result[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
-//           });
-//         }
-
-//         if (!result.Address) {
-//           const labels = Array.from(document.querySelectorAll("div.col-md-8.col-sm-8-col-xs-8.nopaddingleft label")).map(l => l.innerText.trim());
-//           if (labels.length) result.Address = labels.join(" ");
-//         }
-
-//         return result;
-//       },
-//       { companyName: originalName, foundName: bestMatch.name, bestScore: bestMatch.score, usedQuery }
-//     );
-//       if (!info.Address) info.Address = bestMatch.address || "";
-//     // ✅ Check city using improved method
-//     if (!cityMatches(info.Address, city)) {
-//       console.log(`❌ City mismatch: expected "${city}" but got "${info.Address}"`);
-//       return {
-//         InputRaisonSociale: originalName,
-//         InputCity: city,
-//         Status: "Not Found - City Mismatch",
-//         Message: `Best match found (${bestMatch.name}) but city does not match.`,
-//         BestMatchScore: bestMatch.score,
-//         FoundRaisonSociale: bestMatch.name,
-//       };
-//     }
-
-//     console.log(`✅ Successfully found: "${bestMatch.name}"`);
-//     return info;
-//   }
-
-//   // Step 5: fallback recommendations
-//   console.log(`⚠️ No good match found, returning top results`);
-//   const topResults = results.filter(r => similarity(originalName, r.name) > 0.5).slice(0, 3);
-//   const recommendations = [];
-
-//   for (const result of topResults) {
-//     await page.goto(`https://www.charika.ma/${result.href}`, { waitUntil: "domcontentloaded", timeout: 10000 });
-//     const details = await page.evaluate(() => {
-//       const res = {};
-//       const table = document.querySelector("div.col-md-7 table.informations-entreprise");
-//       if (table) {
-//         table.querySelectorAll("tbody tr").forEach(row => {
-//           const cells = row.querySelectorAll("td");
-//           if (cells.length < 2) return;
-//           const field = cells[0].innerText.trim();
-//           const value = cells[1].innerText.trim();
-//           res[field.replace(/[^a-zA-Z0-9]/g, "")] = value;
-//         });
-//       }
-//       return res;
-//     });
-//     const score = similarity(originalName, result.name);
-//     const cityMatch = cityMatches(result.address, city);
-//     recommendations.push({
-//       name: result.name,
-//       url: `https://www.charika.ma/${result.href}`,
-//       position: topResults.indexOf(result) + 1,
-//       matchScore: score,
-//       cityMatches: cityMatch,
-//       details: { ...details, adresse_complete: result.address }
-//     });
-//     await page.waitForTimeout(300);
-//   }
-
-//   return {
-//     InputRaisonSociale: originalName,
-//     InputCity: city || null,
-//     Status: "Not Found - Showing Search Results",
-//     Message: `No exact match found. Showing top ${recommendations.length} results.`,
-//     BestMatchScore: bestMatch.score,
-//     TotalResultsFound: results.length,
-//     Recommendations: recommendations
-//   };
-// }
 
 // Helper: city matching including RCTribunal fallback
 function cityMatches(address, city, rcTribunal = null) {
@@ -1450,10 +1144,40 @@ function getNextResultFilename() {
   const next = existing.length > 0 ? Math.max(...existing) + 1 : 1;
   return path.join(RESULTS_DIR, `results_${next}.xlsx`);
 }
+
+
+   //LOGIN ENDPOINT
+
+app.post("/api/login", async (req, res) => {
+  console.log("🔑 Login endpoint called");
+  
+  try {
+    updateLoginStatus({ status: 'connecting', error: null });
+    const result = await initializeBrowserAndLogin();
+    res.json(result);
+  } catch (error) {
+    console.error("Login failed:", error);
+    
+    updateLoginStatus({ 
+      isLoggedIn: false,
+      status: 'error',
+      lastLoginAttempt: new Date().toISOString(),
+      error: error.message,
+      sessionAge: null
+    });
+    
+    res.status(500).json({ 
+      success: false, 
+      error: error.message,
+      status: loginStatus
+    });
+  }
+});
+
  
-/* =======================
-   SESSION STATUS ENDPOINT
-======================= */
+
+   //SESSION STATUS ENDPOINT
+
 app.get("/api/session", (req, res) => {
   if (loginStatus.isLoggedIn) {
     const now = Date.now();
@@ -1469,9 +1193,9 @@ app.get("/api/session", (req, res) => {
   });
 });
 
-/* =======================
-   HEALTH CHECK
-======================= */
+
+   //HEALTH CHECK
+
 app.get("/api/health", (req, res) => {
   res.json({ 
     status: "OK", 
@@ -1483,9 +1207,9 @@ app.get("/api/health", (req, res) => {
   });
 });
 
-/* =======================
-   LOGOUT ENDPOINT
-======================= */
+
+  // LOGOUT ENDPOINT
+
 app.post("/api/logout", async (req, res) => {
   console.log("👋 Logout endpoint called");
   
@@ -1512,275 +1236,62 @@ app.post("/api/logout", async (req, res) => {
   });
 });
 
-/* =======================
-   ICE DATA ENDPOINT
-======================= */
-app.post("/api/ice", async (req, res) => {
-  const ice = (req.body?.ice || "").trim();
 
-  if (!ice || !/^\d+$/.test(ice)) {
-    return res.status(400).json({
-      success: false,
-      error: "ICE must be a numeric string",
+
+
+  // SEARCH ENDPOINT - WITH TOP 3 RECOMMENDATIONS
+
+app.post("/api/search", async (req, res) => {
+  const { name, city } = req.body;
+  
+  if (!name) {
+    return res.status(400).json({ 
+      error: "Company name is required",
+      InputRaisonSociale: null,
+      Status: "Error"
     });
   }
 
+  const startTime = Date.now();
+  
   try {
-    const data = await fetchIceData(ice);
-    return res.json({ success: true, data });
-  } catch (err) {
-    return res.status(500).json({
-      success: false,
-      error: err.message,
+    const isLoggedIn = await ensureLoggedIn();
+    
+    if (!isLoggedIn || !page) {
+      return res.status(401).json({
+        InputRaisonSociale: name,
+        Status: "Not Authenticated",
+        ErrorMessage: "Please login first using /api/login endpoint",
+        ResponseTime: Date.now() - startTime
+      });
+    }
+    const localPage = getPage();
+    const result = await performSearch(name, city, localPage);
+    result.ResponseTime = Date.now() - startTime;
+    
+    res.json(result);
+    
+  } catch (error) {
+    console.error(`Search error for ${name}:`, error);
+    
+    if (error.message.includes('Session') || error.message.includes('login')) {
+      updateLoginStatus({ isLoggedIn: false, status: 'disconnected' });
+      return res.status(401).json({
+        InputRaisonSociale: name,
+        Status: "Session Expired",
+        ErrorMessage: "Session expired. Please login again.",
+        ResponseTime: Date.now() - startTime
+      });
+    }
+    
+    res.status(500).json({
+      InputRaisonSociale: name,
+      Status: "Error",
+      ErrorMessage: error.message,
+      ResponseTime: Date.now() - startTime
     });
   }
 });
-
-// Bulk search jobs storage
-const jobs = {};
-
-// // Bulk search endpoint with improved session management
-// app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
-//   if (!req.file) {
-//     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
-//   }
-
-//   let rows;
-//   try {
-//     const wb = XLSX.read(req.file.buffer, { type: "buffer" });
-//     const ws = wb.Sheets[wb.SheetNames[0]];
-//     rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-//   } catch {
-//     return res.status(400).json({ success: false, error: "Invalid Excel file." });
-//   }
-
-//   if (!rows.length) {
-//     return res.status(400).json({ success: false, error: "Empty file." });
-//   }
-
-//   const jobId = uuidv4();
-//   jobs[jobId] = {
-//     status: "running",
-//     processed: 0,
-//     total: rows.length,
-//     summary: null,
-//     resultFile: null,
-//     errors: 0,
-//     found: 0,
-//     notFound: 0,
-//     retries: 0,
-//     failedRows: [],
-//     createdAt: new Date().toISOString()
-//   };
-
-//   res.json({ success: true, jobId, message: "Bulk job started" });
-
-//   // Background processing
-//   (async () => {
-//     try {
-//       const { startIndex, results } = loadProgress(rows.length);
-//       const concurrency = Math.min(parseInt(req.query.concurrency || "2"), 3);
-//       const MAX_RETRIES = 3;
-      
-//       // Track rows that need retry
-//       const retryQueue = [];
-
-//       for (let i = startIndex; i < rows.length; i += BATCH_SIZE) {
-//         const batch = rows.slice(i, i + BATCH_SIZE);
-
-//         // Ensure fresh session before each batch
-//         let sessionValid = await ensureFreshSession();
-//         if (!sessionValid) {
-//           console.log(`⚠️ Job ${jobId}: Session invalid, reinitializing browser...`);
-//           await initializeBrowserAndLogin();
-//           await new Promise(r => setTimeout(r, 2000));
-//         }
-
-//         for (let j = 0; j < batch.length; j += concurrency) {
-//           const subBatch = batch.slice(j, j + concurrency);
-          
-//           const batchPromises = subBatch.map(async (row, k) => {
-//             const index = i + j + k;
-//             let retries = 0;
-            
-//             const processWithRetry = async () => {
-//               const { idClients, name, city } = extractRowFields(row);
-
-//               if (!name) {
-//                 results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
-//                 jobs[jobId].errors++;
-//                 jobs[jobId].processed++;
-//                 return;
-//               }
-
-//               const t0 = Date.now();
-//               try {
-//                 // Check session before each search
-//                 const isLoggedIn = await ensureLoggedIn();
-//                 if (!isLoggedIn) {
-//                   console.log(`🔄 Job ${jobId}: Session lost, reconnecting...`);
-//                   await initializeBrowserAndLogin();
-//                   await new Promise(r => setTimeout(r, 1000));
-//                 }
-
-//                 const localPage = getPage();
-//                 const result = await performSearch(name, city || undefined, localPage);
-//                 const responseTime = Date.now() - t0;
-
-//                 results[index] = { input: { idClients, name, city }, result, responseTime };
-
-//                 if (result.Status === "Found") jobs[jobId].found++;
-//                 else jobs[jobId].notFound++;
-
-//                 jobs[jobId].processed++;
-                
-//                 // Save progress after each successful row
-//                 saveProgress(results, index);
-                
-//               } catch (err) {
-//                 console.error(`❌ Job ${jobId} - Row ${index + 1} failed:`, err.message);
-                
-//                 // Check if it's a session/auth error
-//                 const isSessionError = err.message.toLowerCase().includes('session') || 
-//                                       err.message.toLowerCase().includes('login') ||
-//                                       err.message.toLowerCase().includes('authenticated');
-                
-//                 if (isSessionError && retries < MAX_RETRIES) {
-//                   retries++;
-//                   jobs[jobId].retries++;
-//                   console.log(`🔄 Retry ${retries}/${MAX_RETRIES} for row ${index + 1} (${name})`);
-                  
-//                   // Reinitialize session
-//                   await initializeBrowserAndLogin();
-//                   await new Promise(r => setTimeout(r, 2000));
-                  
-//                   // Retry this specific row
-//                   return processWithRetry();
-//                 } else {
-//                   // Failed after retries or non-session error
-//                   results[index] = {
-//                     input: { idClients, name, city },
-//                     error: err.message,
-//                     responseTime: Date.now() - t0,
-//                     retriesAttempted: retries
-//                   };
-//                   jobs[jobId].errors++;
-//                   jobs[jobId].processed++;
-                  
-//                   // Store failed row info for final retry phase
-//                   if (isSessionError && retries >= MAX_RETRIES) {
-//                     retryQueue.push({ index, row, retries });
-//                   }
-                  
-//                   saveProgress(results, index);
-//                 }
-//               }
-//             };
-            
-//             await processWithRetry();
-//           });
-          
-//           await Promise.all(batchPromises);
-//           await new Promise(r => setTimeout(r, 300)); // Small delay between batches
-//         }
-
-//         saveProgress(results, i + batch.length);
-//         savePartialExcel(results);
-        
-//         // Update job status periodically
-//         jobs[jobId].summary = {
-//           total: rows.length,
-//           processed: jobs[jobId].processed,
-//           found: jobs[jobId].found,
-//           notFound: jobs[jobId].notFound,
-//           errors: jobs[jobId].errors,
-//           retries: jobs[jobId].retries
-//         };
-//       }
-
-//       // Phase 2: Final retry for session-failed rows with fresh browser
-//       if (retryQueue.length > 0) {
-//         console.log(`🔁 Job ${jobId}: Final retry phase for ${retryQueue.length} session-failed rows...`);
-        
-//         // Force fresh browser instance
-//         if (browser) {
-//           await browser.close().catch(() => {});
-//           browser = null;
-//           page = null;
-//         }
-        
-//         await initializeBrowserAndLogin();
-//         await new Promise(r => setTimeout(r, 3000));
-        
-//         for (const { index, row } of retryQueue) {
-//           const { idClients, name, city } = extractRowFields(row);
-//           const t0 = Date.now();
-          
-//           try {
-//             const localPage = getPage();
-//             const result = await performSearch(name, city || undefined, localPage);
-//             const responseTime = Date.now() - t0;
-            
-//             results[index] = { input: { idClients, name, city }, result, responseTime };
-            
-//             if (result.Status === "Found") jobs[jobId].found++;
-//             else jobs[jobId].notFound++;
-            
-//             jobs[jobId].errors--; // Remove from error count
-//             jobs[jobId].processed++;
-            
-//             console.log(`✅ Row ${index + 1} recovered on final retry`);
-//             saveProgress(results, index);
-            
-//           } catch (err) {
-//             console.error(`❌ Final retry failed for row ${index + 1}:`, err.message);
-//             // Keep the existing error in results
-//           }
-          
-//           await new Promise(r => setTimeout(r, 500));
-//         }
-//       }
-
-//       // Save final Excel
-//       const wb = buildResultWorkbook(results);
-//       const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-//       const filePath = getNextResultFilename();
-//       fs.writeFileSync(filePath, buffer);
-
-//       jobs[jobId].status = "done";
-//       jobs[jobId].resultFile = filePath;
-//       jobs[jobId].summary = {
-//         total: rows.length,
-//         processed: jobs[jobId].processed,
-//         found: jobs[jobId].found,
-//         notFound: jobs[jobId].notFound,
-//         errors: jobs[jobId].errors,
-//         retries: jobs[jobId].retries,
-//         recoveredRows: retryQueue.length - (jobs[jobId].errors - (jobs[jobId].errors - retryQueue.length))
-//       };
-      
-//       // Clean up progress file after successful completion
-//       if (fs.existsSync(PROGRESS_FILE)) {
-//         fs.unlinkSync(PROGRESS_FILE);
-//         console.log(`🧹 Cleaned up progress file for job ${jobId}`);
-//       }
-      
-//       console.log(`✅ Job ${jobId} completed successfully`);
-
-//     } catch (err) {
-//       console.error(`💥 Job ${jobId} fatal error:`, err);
-//       jobs[jobId].status = "error";
-//       jobs[jobId].error = err.message;
-      
-//       // Save whatever we have before crashing
-//       try {
-//         savePartialExcel(jobs[jobId].results || []);
-//       } catch (saveErr) {
-//         console.error("Failed to save partial results:", saveErr);
-//       }
-//     }
-//   })();
-// });
 
 // Bulk search endpoint with background processing and top recommendation only
 app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
