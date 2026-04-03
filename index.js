@@ -1293,7 +1293,203 @@ app.post("/api/search", async (req, res) => {
   }
 });
 
-// Bulk search endpoint with background processing and top recommendation only
+// // Bulk search endpoint with background processing and top recommendation only
+// app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
+//   if (!req.file) {
+//     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
+//   }
+
+//   let rows;
+//   try {
+//     const wb = XLSX.read(req.file.buffer, { type: "buffer" });
+//     const ws = wb.Sheets[wb.SheetNames[0]];
+//     rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
+//   } catch {
+//     return res.status(400).json({ success: false, error: "Invalid Excel file." });
+//   }
+
+//   if (!rows.length) {
+//     return res.status(400).json({ success: false, error: "Empty file." });
+//   }
+
+//   const jobId = uuidv4();
+//   jobs[jobId] = {
+//     status: "running",
+//     processed: 0,
+//     total: rows.length,
+//     summary: null,
+//     resultFile: null,
+//     errors: 0,
+//     found: 0,
+//     notFound: 0,
+//     retries: 0,
+//     failedRows: [],
+//     createdAt: new Date().toISOString()
+//   };
+
+//   // Return immediately
+//   res.json({ success: true, jobId, message: "Bulk job started" });
+
+//   // Background processing
+//   (async () => {
+//     try {
+//       const { startIndex, results } = loadProgress(rows.length);
+//       const concurrency = Math.min(parseInt(req.query.concurrency || "2"), 3);
+//       const MAX_RETRIES = 3;
+//       const retryQueue = [];
+
+//       for (let i = startIndex; i < rows.length; i += BATCH_SIZE) {
+//         const batch = rows.slice(i, i + BATCH_SIZE);
+
+//         let sessionValid = await ensureFreshSession();
+//         if (!sessionValid) await initializeBrowserAndLogin();
+
+//         for (let j = 0; j < batch.length; j += concurrency) {
+//           const subBatch = batch.slice(j, j + concurrency);
+
+//           await Promise.all(subBatch.map(async (row, k) => {
+//             const index = i + j + k;
+//             let retries = 0;
+
+//             const processWithRetry = async () => {
+//               const { idClients, name, city } = extractRowFields(row);
+//               if (!name) {
+//                 results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
+//                 jobs[jobId].errors++;
+//                 jobs[jobId].processed++;
+//                 return;
+//               }
+
+//               const t0 = Date.now();
+//               try {
+//                 const isLoggedIn = await ensureLoggedIn();
+//                 if (!isLoggedIn) await initializeBrowserAndLogin();
+
+//                 const localPage = getPage();
+//                 let result = await performSearch(name, city || undefined, localPage);
+
+//                 // Keep only the recommendation with the highest MatchScore
+//                 if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
+//                   const best = result.Recommendations.reduce(
+//                     (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+//                     {}
+//                   );
+//                   result.Recommendations = [best];
+//                 }
+
+//                 const responseTime = Date.now() - t0;
+//                 results[index] = { input: { idClients, name, city }, result, responseTime };
+
+//                 if (result.Status === "Found") jobs[jobId].found++;
+//                 else jobs[jobId].notFound++;
+
+//                 jobs[jobId].processed++;
+//                 saveProgress(results, index);
+
+//               } catch (err) {
+//                 const isSessionError = /session|login|authenticated/i.test(err.message);
+//                 if (isSessionError && retries < MAX_RETRIES) {
+//                   retries++;
+//                   jobs[jobId].retries++;
+//                   await initializeBrowserAndLogin();
+//                   await new Promise(r => setTimeout(r, 2000));
+//                   return processWithRetry();
+//                 } else {
+//                   results[index] = {
+//                     input: { idClients, name, city },
+//                     error: err.message,
+//                     responseTime: Date.now() - t0,
+//                     retriesAttempted: retries
+//                   };
+//                   jobs[jobId].errors++;
+//                   jobs[jobId].processed++;
+//                   if (isSessionError && retries >= MAX_RETRIES) retryQueue.push({ index, row, retries });
+//                   saveProgress(results, index);
+//                 }
+//               }
+//             };
+
+//             await processWithRetry();
+//           }));
+
+//           await new Promise(r => setTimeout(r, 300));
+//         }
+
+//         saveProgress(results, i + batch.length);
+//         savePartialExcel(results);
+
+//         jobs[jobId].summary = {
+//           total: rows.length,
+//           processed: jobs[jobId].processed,
+//           found: jobs[jobId].found,
+//           notFound: jobs[jobId].notFound,
+//           errors: jobs[jobId].errors,
+//           retries: jobs[jobId].retries
+//         };
+//       }
+
+//       // Final retry for session errors
+//       if (retryQueue.length > 0) {
+//         if (browser) { await browser.close().catch(() => {}); browser = null; page = null; }
+//         await initializeBrowserAndLogin();
+//         await new Promise(r => setTimeout(r, 3000));
+
+//         for (const { index, row } of retryQueue) {
+//           const { idClients, name, city } = extractRowFields(row);
+//           const t0 = Date.now();
+//           try {
+//             const localPage = getPage();
+//             let result = await performSearch(name, city || undefined, localPage);
+//             if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
+//               const best = result.Recommendations.reduce(
+//                 (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+//                 {}
+//               );
+//               result.Recommendations = [best];
+//             }
+//             results[index] = { input: { idClients, name, city }, result, responseTime: Date.now() - t0 };
+//             if (result.Status === "Found") jobs[jobId].found++;
+//             else jobs[jobId].notFound++;
+//             jobs[jobId].errors--;
+//             jobs[jobId].processed++;
+//             saveProgress(results, index);
+//           } catch {}
+//           await new Promise(r => setTimeout(r, 500));
+//         }
+//       }
+
+//       // Save final Excel
+//       const wb = buildResultWorkbook(results);
+//       const buffer = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
+//       const filePath = getNextResultFilename();
+//       fs.writeFileSync(filePath, buffer);
+
+//       jobs[jobId].status = "done";
+//       jobs[jobId].resultFile = filePath;
+//       jobs[jobId].summary = {
+//         total: rows.length,
+//         processed: jobs[jobId].processed,
+//         found: jobs[jobId].found,
+//         notFound: jobs[jobId].notFound,
+//         errors: jobs[jobId].errors,
+//         retries: jobs[jobId].retries
+//       };
+
+//       if (fs.existsSync(PROGRESS_FILE)) fs.unlinkSync(PROGRESS_FILE);
+//       console.log(`✅ Job ${jobId} completed successfully`);
+
+//     } catch (err) {
+//       console.error(`💥 Job ${jobId} fatal error:`, err);
+//       jobs[jobId].status = "error";
+//       jobs[jobId].error = err.message;
+
+//       // Attempt to save partial results if possible
+//       try { savePartialExcel(jobs[jobId].results || []); } catch {}
+//     }
+//   })();
+// });
+
+
 app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
   if (!req.file) {
     return res.status(400).json({ success: false, error: 'No file uploaded. Use "file" field.' });
@@ -1327,7 +1523,7 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
     createdAt: new Date().toISOString()
   };
 
-  // Return immediately
+  // Respond immediately
   res.json({ success: true, jobId, message: "Bulk job started" });
 
   // Background processing
@@ -1353,8 +1549,16 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
 
             const processWithRetry = async () => {
               const { idClients, name, city } = extractRowFields(row);
+
+              // Ensure we always have a row in results
+              if (!results[index]) results[index] = { input: { idClients, name, city }, result: null, responseTime: 0 };
+
               if (!name) {
-                results[index] = { input: { idClients, name: "", city }, error: "Empty name", responseTime: 0 };
+                results[index] = {
+                  input: { idClients, name: "", city },
+                  result: { Status: "Error", Message: "Empty name" },
+                  responseTime: 0
+                };
                 jobs[jobId].errors++;
                 jobs[jobId].processed++;
                 return;
@@ -1368,10 +1572,10 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
                 const localPage = getPage();
                 let result = await performSearch(name, city || undefined, localPage);
 
-                // Keep only the recommendation with the highest MatchScore
+                // Keep only the recommendation with highest MatchScore
                 if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
                   const best = result.Recommendations.reduce(
-                    (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+                    (max, r) => r.matchScore > (max.matchScore || 0) ? r : max,
                     {}
                   );
                   result.Recommendations = [best];
@@ -1397,7 +1601,7 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
                 } else {
                   results[index] = {
                     input: { idClients, name, city },
-                    error: err.message,
+                    result: { Status: "Error", Message: err.message },
                     responseTime: Date.now() - t0,
                     retriesAttempted: retries
                   };
@@ -1428,7 +1632,7 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
         };
       }
 
-      // Final retry for session errors
+      // Retry failed session rows
       if (retryQueue.length > 0) {
         if (browser) { await browser.close().catch(() => {}); browser = null; page = null; }
         await initializeBrowserAndLogin();
@@ -1442,7 +1646,7 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
             let result = await performSearch(name, city || undefined, localPage);
             if (result.Recommendations && Array.isArray(result.Recommendations) && result.Recommendations.length > 0) {
               const best = result.Recommendations.reduce(
-                (max, r) => r.MatchScore > (max.MatchScore || 0) ? r : max,
+                (max, r) => r.matchScore > (max.matchScore || 0) ? r : max,
                 {}
               );
               result.Recommendations = [best];
@@ -1453,7 +1657,15 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
             jobs[jobId].errors--;
             jobs[jobId].processed++;
             saveProgress(results, index);
-          } catch {}
+          } catch (err) {
+            results[index] = {
+              input: { idClients, name, city },
+              result: { Status: "Error", Message: err.message },
+              responseTime: Date.now() - t0
+            };
+            jobs[jobId].errors++;
+            jobs[jobId].processed++;
+          }
           await new Promise(r => setTimeout(r, 500));
         }
       }
@@ -1483,7 +1695,6 @@ app.post("/api/bulk-search", upload.single("file"), async (req, res) => {
       jobs[jobId].status = "error";
       jobs[jobId].error = err.message;
 
-      // Attempt to save partial results if possible
       try { savePartialExcel(jobs[jobId].results || []); } catch {}
     }
   })();
