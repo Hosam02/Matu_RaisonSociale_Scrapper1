@@ -12,6 +12,7 @@ import { v4 as uuidv4 } from "uuid";
 import cors from "cors";
 import { EventEmitter } from "events";
 import { searchCache } from "./cache/searchCache.js";
+import { env } from "process";
 
 const app = express();
 const server = createServer(app);
@@ -2114,7 +2115,7 @@ setInterval(() => {
   });
 }, 15000);
 
-const PORT = 3006
+const PORT = env.PORT || 3006;
 
 server.listen(PORT, () => {
   console.log(`🚀 Scalable server running on http://localhost:${PORT}`);
