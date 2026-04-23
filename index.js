@@ -187,15 +187,18 @@ function isInvalidRC(rc) {
 }
 function cityMatches(address, city, rcTribunal = null) {
   if (!city) return true;
-  const normalizedCity = normalizeString(city);
-  const normalizedAddress = normalizeString(address || "");
-  const normalizedRC = rcTribunal ? normalizeString(rcTribunal) : "";
-  const tokens = normalizedCity.split(" ");
-  return tokens.every(
-    (t) => normalizedAddress.includes(t) || normalizedRC.includes(t)
+
+  const normalize = normalizeString;
+
+  const inputCity = normalize(city);
+  const addressCity = extractCityFromAddress(address);
+  const rcCity = rcTribunal ? normalize(rcTribunal) : "";
+
+  return (
+    addressCity?.includes(inputCity) ||
+    rcCity.includes(inputCity)
   );
 }
-
 function generateSearchVariants(name) {
   const cleaned = cleanName(name);
   const words = cleaned.split(/\s+/).filter(Boolean);
@@ -925,7 +928,7 @@ async function buildRecommendations(page, results, originalName, city, searchId)
 
   return recommendations;
 }
-async function performSearch(companyName, city, page, hasRetried = false) {
+async function performSearch(companyName, city, page, ctx, hasRetried = false) {
   const searchId = Math.random().toString(36).substring(2, 8);
 
   LOG.search(`═══════════════════════════════════════════════`);
@@ -937,7 +940,6 @@ async function performSearch(companyName, city, page, hasRetried = false) {
 
   const cacheKey = `${cleanedName}::${normalizedCity}`;
 
-  // 🧠 CACHE CHECK (skip cache if retrying to avoid caching bad RC)
   if (!hasRetried) {
     const cached = searchCache.get(cacheKey);
     if (cached) {
@@ -1055,6 +1057,7 @@ async function performSearch(companyName, city, page, hasRetried = false) {
           });
         }
 
+        // ✅ ADDRESS EXTRACTION (restored)
         const addressBlocks = Array.from(
           document.querySelectorAll("div.row.ligne-tfmw")
         );
@@ -1073,14 +1076,17 @@ async function performSearch(companyName, city, page, hasRetried = false) {
           }
         }
 
+        // fallback 1
         if (!result.Address) {
           const labels = Array.from(document.querySelectorAll("label")).map((l) =>
             l.innerText.trim()
           );
+
           const maybe = labels.find((l) => l.match(/\d{3,}/));
           if (maybe) result.Address = maybe;
         }
 
+        // fallback 2
         if (!result.Address) {
           const match = document.body.innerText.match(
             /Adresse\s*[:\-]?\s*(.+)/i
@@ -1100,8 +1106,8 @@ async function performSearch(companyName, city, page, hasRetried = false) {
       }
     );
 
-    // 🚨 GLOBAL RC VALIDATION (outside browser)
-    if (!info.RCNumber) {
+    // 🚨 RC VALIDATION + RETRY
+    if (!info.RCNumber || String(info.RCNumber).toLowerCase().includes("afficher")) {
       if (hasRetried) {
         LOG.warn(`[${searchId}] RC still invalid after retry`);
         return info;
@@ -1115,31 +1121,7 @@ async function performSearch(companyName, city, page, hasRetried = false) {
         waitUntil: "domcontentloaded",
       });
 
-      return await performSearch(companyName, city, page, true);
-    }
-
-    // ── CITY CHECK ─────────────────────────────
-    if (!cityMatches(info.Address, city, info.RCTribunal)) {
-      const recommendations = await buildRecommendations(
-        page,
-        results,
-        originalName,
-        city,
-        searchId
-      );
-
-      const cityMismatchResponse = {
-        InputRaisonSociale: originalName,
-        InputCity: city,
-        Status: "Not Found - City Mismatch",
-        Message: `Best match found (${bestMatch.name}) but city does not match.`,
-        BestMatchScore: bestMatch.score,
-        FoundRaisonSociale: bestMatch.name,
-        Recommendations: recommendations,
-      };
-
-      searchCache.set(cacheKey, cityMismatchResponse);
-      return cityMismatchResponse;
+      return await performSearch(companyName, city, page, ctx, true);
     }
 
     const finalInfo = { ...info, cached: false };
@@ -1159,10 +1141,7 @@ async function performSearch(companyName, city, page, hasRetried = false) {
   const response = {
     InputRaisonSociale: originalName,
     InputCity: city || null,
-    Status: "Not Found - Showing Search Results",
-    Message: `No exact match found. Showing top ${recommendations.length} results.`,
-    BestMatchScore: bestMatch?.score ?? 0,
-    TotalResultsFound: results.length,
+    Status: "Not Found",
     Recommendations: recommendations,
   };
 
@@ -1577,14 +1556,15 @@ app.post("/api/logout", async (req, res) => {
 app.post("/api/search", async (req, res) => {
   const { name, city, contextId } = req.body;
   const requestId = Math.random().toString(36).substring(2, 8);
-  
-  LOG.info("API", `[${requestId}] /api/search called: name="${name}", city="${city}", contextId=${contextId ? contextId.slice(0, 8) : "auto"}`);
+
+  LOG.info(
+    "API",
+    `[${requestId}] /api/search called: name="${name}", city="${city}", contextId=${contextId ? contextId.slice(0, 8) : "auto"}`
+  );
 
   if (!name) {
-    LOG.warn("API", `[${requestId}] Missing name parameter`);
     return res.status(400).json({
       error: "Company name is required",
-      InputRaisonSociale: null,
       Status: "Error",
     });
   }
@@ -1594,53 +1574,44 @@ app.post("/api/search", async (req, res) => {
   let acquiredHere = false;
 
   try {
+    // ── CONTEXT ACQUIRE ─────────────────────────────
     if (contextId && pool.contexts.has(contextId)) {
       ctx = pool.contexts.get(contextId);
+
       if (pool.available.has(contextId)) {
         pool.available.delete(contextId);
         acquiredHere = true;
       }
+
       LOG.info("API", `[${requestId}] Using sticky context ${ctx.id.slice(0, 8)}`);
     } else {
-      LOG.info("API", `[${requestId}] Acquiring context from pool...`);
       ctx = await pool.acquireContext();
       acquiredHere = true;
       LOG.info("API", `[${requestId}] Acquired context ${ctx.id.slice(0, 8)}`);
     }
 
-    LOG.info("API", `[${requestId}] Ensuring fresh session...`);
+    // ── SESSION CHECK ─────────────────────────────
     const sessionOk = await ctx.ensureFreshSession();
     if (!sessionOk) {
-      LOG.info("API", `[${requestId}] Session stale, reinitializing...`);
+      LOG.info("API", `[${requestId}] Session stale → reinitializing`);
       await ctx.initialize();
     }
 
     const page = ctx.getPage();
-    LOG.info("API", `[${requestId}] Starting search on page...`);
-    
-    const result = await performSearch(name, city, page);
 
-    if (result === "SESSION_EXPIRED") {
-      LOG.warn("API", `[${requestId}] SESSION_EXPIRED returned, reinitializing...`);
-      await ctx.initialize();
-      const retryPage = ctx.getPage();
-      LOG.info("API", `[${requestId}] Retrying search after reinit...`);
-      const retryResult = await performSearch(name, city, retryPage);
-      retryResult.ResponseTime = Date.now() - startTime;
-      LOG.info("API", `[${requestId}] Retry successful, total time=${retryResult.ResponseTime}ms`);
-      res.json(retryResult);
-      return;
-    }
+    // ── 🔥 MAIN CALL (with ctx) ─────────────────────
+    const result = await performSearch(name, city, page, ctx);
 
     result.ResponseTime = Date.now() - startTime;
-    LOG.info("API", `[${requestId}] Search complete: Status=${result.Status}, time=${result.ResponseTime}ms`);
+
+    LOG.info(
+      "API",
+      `[${requestId}] Done: Status=${result.Status}, time=${result.ResponseTime}ms`
+    );
+
     res.json(result);
   } catch (error) {
-    LOG.error("API", `[${requestId}] Search error: ${error.message}`);
-    
-    if (error.message.includes("SESSION_EXPIRED")) {
-      if (ctx) await ctx.initialize().catch(() => {});
-    }
+    LOG.error("API", `[${requestId}] Error: ${error.message}`);
 
     res.status(500).json({
       InputRaisonSociale: name,
@@ -1650,8 +1621,8 @@ app.post("/api/search", async (req, res) => {
     });
   } finally {
     if (acquiredHere && ctx) {
-      LOG.info("API", `[${requestId}] Releasing context ${ctx.id.slice(0, 8)} back to pool`);
       pool.releaseContext(ctx);
+      LOG.info("API", `[${requestId}] Released context ${ctx.id.slice(0, 8)}`);
     }
   }
 });
