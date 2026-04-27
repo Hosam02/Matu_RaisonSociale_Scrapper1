@@ -185,6 +185,25 @@ function isInvalidRC(rc) {
     !/^\d+$/.test(rc)                  // not numeric
   );
 }
+function extractCityFromAddress(address) {
+  if (!address) return "";
+  
+  const normalized = normalizeString(address);
+  
+  // Common Moroccan city patterns in addresses
+  // Look for " - City (M)" or " - City" patterns
+  const match = normalized.match(/-\s*([A-Z\s]+?)(?:\s*\([A-Z]\))?\s*$/);
+  if (match) return match[1].trim();
+  
+  // Fallback: return last significant word(s)
+  const parts = normalized.split(/\s+/).filter(Boolean);
+  if (parts.length >= 2) {
+    // Try last 2-3 words as city
+    return parts.slice(-3).join(" ");
+  }
+  
+  return normalized;
+}
 function cityMatches(address, city, rcTribunal = null) {
   if (!city) return true;
 
@@ -256,6 +275,7 @@ class BrowserContextManager extends EventEmitter {
     await prevLock;
     return () => resolveLock();
   }
+  
 
   async initialize() {
     const release = await this.acquire();
@@ -399,13 +419,27 @@ class BrowserContextManager extends EventEmitter {
   }
 
   getPage() {
-    this.lastUsed = Date.now();
-    this.searchCount++;
-    const p = this.pages[this.pageIndex % this.pages.length];
-    this.pageIndex++;
-    LOG.session(`Assigning page ${this.pageIndex % this.pages.length} (search #${this.searchCount})`);
-    return p;
+  this.lastUsed = Date.now();
+  this.searchCount++;
+  
+  // Check if context is still usable
+  if (!this.browser || !this.context || !this.pages.length) {
+    LOG.error("ContextManager", `Context ${this.id.slice(0,8)} has null browser/context/pages`);
+    throw new Error("Context not initialized");
   }
+  
+  const p = this.pages[this.pageIndex % this.pages.length];
+  
+  // If page is closed, try to create a new one or fail
+  if (p.isClosed?.()) {
+    LOG.warn("ContextManager", `Page ${this.pageIndex % this.pages.length} is closed in ${this.id.slice(0,8)}`);
+    throw new Error("Page has been closed");
+  }
+  
+  this.pageIndex++;
+  LOG.session(`Assigning page ${this.pageIndex % this.pages.length} (search #${this.searchCount})`);
+  return p;
+}
 
   async ensureFreshSession() {
     const now = Date.now();
@@ -534,20 +568,34 @@ class ContextPool {
 
   // 1. If preferred context is available → use it
   if (preferredId && this.available.has(preferredId)) {
-    LOG.pool(`Reusing preferred context ${preferredId.slice(0, 8)}`);
-    this.available.delete(preferredId);
-    return this.contexts.get(preferredId);
+    const ctx = this.contexts.get(preferredId);
+    // Validate it's actually alive
+    if (ctx && ctx.browser && ctx.context) {
+      LOG.pool(`Reusing preferred context ${preferredId.slice(0, 8)}`);
+      this.available.delete(preferredId);
+      return ctx;
+    } else {
+      LOG.pool(`Preferred context ${preferredId.slice(0, 8)} is dead, removing`);
+      this.removeContext(preferredId);
+    }
   }
 
-  // 2. 🔥 NEW: reuse ANY available context
-  const availableId = this.available.values().next().value;
-  if (availableId) {
-    LOG.pool(`♻️ Reusing idle context ${availableId.slice(0, 8)}`);
-    this.available.delete(availableId);
-    return this.contexts.get(availableId);
+  // 2. Reuse ANY available context (validate first)
+  let availableId = this.available.values().next().value;
+  while (availableId) {
+    const ctx = this.contexts.get(availableId);
+    if (ctx && ctx.browser && ctx.context) {
+      LOG.pool(`♻️ Reusing idle context ${availableId.slice(0, 8)}`);
+      this.available.delete(availableId);
+      return ctx;
+    }
+    // Dead context found, remove and try next
+    LOG.pool(`Dead context ${availableId.slice(0, 8)} found in available pool, removing`);
+    this.removeContext(availableId);
+    availableId = this.available.values().next().value;
   }
 
-  // 3. create new only if pool not full
+  // 3. Create new only if pool not full
   if (this.contexts.size < this.maxContexts) {
     const id = uuidv4();
     LOG.pool(`Creating NEW context ${id.slice(0, 8)} (${this.contexts.size + 1}/${this.maxContexts})`);
@@ -556,32 +604,96 @@ class ContextPool {
     await ctx.initialize();
     return ctx;
   }
-  if (this.waiting.length > MAX_QUEUE_SIZE) {
-  throw new Error("Server overloaded");
-}
-  // 4. queue fallback unchanged
-  LOG.pool(`At capacity (${this.contexts.size}/${this.maxContexts}), queueing...`);}
 
-
-
-
-  releaseContext(context) {
-    if (!this.contexts.has(context.id)) {
-      LOG.warn("ContextPool", `Release failed: context ${context.id.slice(0, 8)} not found`);
-      return;
-    }
-
-    if (this.waiting.length > 0) {
-      const waiter = this.waiting.shift();
-      LOG.pool(`Passing context ${context.id.slice(0, 8)} to queued request (${this.waiting.length} remaining)`);
-      waiter.resolve(context);
-      return;
-    }
-
-    LOG.pool(`Context ${context.id.slice(0, 8)} returned to pool (available=${this.available.size + 1})`);
-    this.available.add(context.id);
+  if (this.waiting.length >= CONCURRENCY.MAX_QUEUE_SIZE) {
+    throw new Error("Server overloaded");
   }
 
+  // 4. At capacity — queue and wait, OR kill oldest idle and create new
+  LOG.pool(`At capacity (${this.contexts.size}/${this.maxContexts}), queueing...`);
+  
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      const idx = this.waiting.findIndex(w => w.resolve === resolve);
+      if (idx !== -1) this.waiting.splice(idx, 1);
+      reject(new Error("Timeout waiting for available context"));
+    }, CONCURRENCY.REQUEST_TIMEOUT_MS);
+
+    this.waiting.push({
+      resolve: (ctx) => {
+        clearTimeout(timeout);
+        resolve(ctx);
+      },
+      reject: (err) => {
+        clearTimeout(timeout);
+        reject(err);
+      }
+    });
+  });
+}
+async replaceContext(deadId) {
+  LOG.pool(`Replacing dead context ${deadId.slice(0, 8)}`);
+  
+  // Remove dead context without cleanup (already dead)
+  this.available.delete(deadId);
+  const deadCtx = this.contexts.get(deadId);
+  if (deadCtx) {
+    // Don't await close, it's already dead
+    deadCtx.browser = null;
+    deadCtx.context = null;
+    deadCtx.pages = [];
+    deadCtx.isLoggedIn = false;
+    deadCtx.status = "replaced";
+    this.contexts.delete(deadId);
+  }
+
+  // Create fresh context
+  const newId = uuidv4();
+  LOG.pool(`Creating replacement context ${newId.slice(0, 8)}`);
+  const ctx = new BrowserContextManager(newId);
+  this.contexts.set(newId, ctx);
+  await ctx.initialize();
+  return ctx;
+}
+releaseContext(context) {
+  if (!this.contexts.has(context.id)) {
+    LOG.warn("ContextPool", `Release failed: context ${context.id.slice(0, 8)} not found (already removed)`);
+    return;
+  }
+
+  // Check if context died while in use
+  if (!context.browser || !context.context) {
+    LOG.warn("ContextPool", `Context ${context.id.slice(0, 8)} died during use, replacing...`);
+    this.replaceContext(context.id).then(newCtx => {
+      if (this.waiting.length > 0) {
+        const waiter = this.waiting.shift();
+        LOG.pool(`Passing replacement context ${newCtx.id.slice(0, 8)} to queued request`);
+        waiter.resolve(newCtx);
+      } else {
+        LOG.pool(`Replacement context ${newCtx.id.slice(0, 8)} added to available pool`);
+        this.available.add(newCtx.id);
+      }
+    }).catch(err => {
+      LOG.error("ContextPool", `Failed to replace context: ${err.message}`);
+      // Notify waiters
+      while (this.waiting.length > 0) {
+        const waiter = this.waiting.shift();
+        waiter.reject(new Error("Context replacement failed"));
+      }
+    });
+    return;
+  }
+
+  if (this.waiting.length > 0) {
+    const waiter = this.waiting.shift();
+    LOG.pool(`Passing context ${context.id.slice(0, 8)} to queued request (${this.waiting.length} remaining)`);
+    waiter.resolve(context);
+    return;
+  }
+
+  LOG.pool(`Context ${context.id.slice(0, 8)} returned to pool (available=${this.available.size + 1})`);
+  this.available.add(context.id);
+}
   removeContext(id) {
     LOG.pool(`Removing context ${id.slice(0, 8)}`);
     this.available.delete(id);
@@ -885,10 +997,37 @@ async function buildRecommendations(page, results, originalName, city, searchId)
             } else if (field.includes("ICE")) res.ICE = value;
             else if (field.includes("Forme juridique")) res.FormeJuridique = value;
             else if (field.includes("Capital")) res.Capital = value;
-            else if (field.includes("Activite") || field.includes("Activité")) res.Activite = value;
-            else if (field.includes("Adresse")) res.Adresse = value;
           });
         }
+
+        // ── ACTIVITY (🔥 NEW) ──
+        const activityEl = document.querySelector("div.truncate-m h2");
+        if (activityEl) res.Activite = activityEl.innerText.trim();
+
+        // ── ADDRESS (🔥 IMPROVED) ──
+        const addressRow = Array.from(document.querySelectorAll("div.ligne-tfmw")).find(el => {
+          const b = el.querySelector("b");
+          return b && b.innerText.toLowerCase().includes("adresse");
+        });
+        if (addressRow) {
+          const label = addressRow.querySelector("label");
+          if (label) res.Adresse = label.innerText.trim();
+        }
+
+        // ── CONTACT INFO (🔥 NEW) ──
+        const contactBlocks = document.querySelectorAll(".marketingInfos .ligne-tfmw, .marketingInfos .dropdown");
+        contactBlocks.forEach((block) => {
+          const label = block.querySelector("b");
+          if (!label) return;
+          const labelText = label.innerText.toLowerCase();
+          const mainValue = block.querySelector(".marketingInfoTelFax");
+          const linkValue = block.querySelector('a[href^="mailto"], a[target="_blank"]');
+
+          if (labelText.includes("tel")) res.Telephone = mainValue?.innerText.trim() || null;
+          else if (labelText.includes("fax")) res.Fax = mainValue?.innerText.trim() || null;
+          else if (labelText.includes("e-mail")) res.Email = linkValue?.innerText.trim() || null;
+          else if (labelText.includes("site web")) res.SiteWeb = linkValue?.innerText.trim() || null;
+        });
 
         return res;
       });
@@ -904,7 +1043,11 @@ async function buildRecommendations(page, results, originalName, city, searchId)
         RCTribunal: details.RCTribunal || null,
         FormeJuridique: details.FormeJuridique || null,
         Capital: details.Capital || null,
-        Activite: details.Activite || null,
+        Activite: details.Activite || null,        // 🔥 NEW
+        Telephone: details.Telephone || null,      // 🔥 NEW
+        Fax: details.Fax || null,                  // 🔥 NEW
+        Email: details.Email || null,              // 🔥 NEW
+        SiteWeb: details.SiteWeb || null,          // 🔥 NEW
         Address: details.Adresse || candidate.address || null,
 
         cityMatches: cityMatches(
@@ -934,6 +1077,10 @@ async function performSearch(companyName, city, page, ctx, hasRetried = false) {
   LOG.search(`═══════════════════════════════════════════════`);
   LOG.search(`[${searchId}] performSearch START`);
   LOG.search(`[${searchId}] Input: name="${companyName}", city="${city}"`);
+  // Validate page is alive
+  if (!page || page.isClosed?.()) {
+    throw new Error("Target page, context or browser has been closed");
+  }
 
   const normalizedCity = city ? normalizeString(city) : "";
   const cleanedName = cleanName(companyName);
@@ -993,8 +1140,7 @@ async function performSearch(companyName, city, page, ctx, hasRetried = false) {
       waitUntil: "domcontentloaded",
       timeout: 10000,
     });
-
-    const info = await page.evaluate(
+        const info = await page.evaluate(
       ({ companyName, foundName, bestScore, usedQuery }) => {
         const result = {
           InputRaisonSociale: companyName,
@@ -1013,6 +1159,7 @@ async function performSearch(companyName, city, page, ctx, hasRetried = false) {
           return n.includes("afficher") || !/^\d+$/.test(rc);
         };
 
+        // ── TABLE EXTRACTION (RC, ICE, Forme, Capital) ──
         const table = document.querySelector(
           "div.col-md-7 table.informations-entreprise"
         );
@@ -1043,57 +1190,84 @@ async function performSearch(companyName, city, page, ctx, hasRetried = false) {
               result.FormeJuridique = value;
             } else if (field.includes("capital")) {
               result.Capital = value;
-            } else if (field.includes("activite")) {
-              result.Activite = value;
-            } else if (field.includes("tel")) {
-              result.Telephone = value;
-            } else if (field.includes("fax")) {
-              result.Fax = value;
-            } else if (field.includes("email")) {
-              result.Email = value;
-            } else if (field.includes("site web")) {
-              result.SiteWeb = value;
             }
           });
         }
 
-        // ✅ ADDRESS EXTRACTION (restored)
-        const addressBlocks = Array.from(
-          document.querySelectorAll("div.row.ligne-tfmw")
-        );
+        // ── ACTIVITY (🔥 NEW) ──
+        const activityEl = document.querySelector("div.truncate-m h2");
+        if (activityEl) {
+          result.Activite = activityEl.innerText.trim();
+        }
 
-        for (const block of addressBlocks) {
-          const label = block.querySelector("b");
-          const value = block.querySelector("label");
-
-          if (!label || !value) continue;
-
-          const labelText = normalize(label.innerText);
-
-          if (labelText.includes("adresse")) {
-            result.Address = value.innerText.trim();
-            break;
+        // ── ADDRESS (🔥 IMPROVED - structured) ──
+        const addressRow = Array.from(document.querySelectorAll("div.ligne-tfmw")).find(el => {
+          const b = el.querySelector("b");
+          return b && normalize(b.innerText).includes("adresse");
+        });
+        if (addressRow) {
+          const label = addressRow.querySelector("label");
+          if (label) {
+            result.Address = label.innerText.trim();
           }
         }
 
-        // fallback 1
+        // ── CONTACT INFO (🔥 NEW - with dropdown support) ──
+        const contactBlocks = document.querySelectorAll(".marketingInfos .ligne-tfmw, .marketingInfos .dropdown");
+
+        contactBlocks.forEach((block) => {
+          const label = block.querySelector("b");
+          if (!label) return;
+
+          const labelText = normalize(label.innerText);
+
+          // Main visible value
+          const mainValue = block.querySelector(".marketingInfoTelFax");
+          const linkValue = block.querySelector('a[href^="mailto"], a[target="_blank"]');
+
+          if (labelText.includes("tel")) {
+            result.Telephone = mainValue?.innerText.trim() || null;
+            // 🔥 Dropdown phones
+            const dropdownPhones = Array.from(block.querySelectorAll(".dropdown-menu .marketingInfoTelFax"))
+              .map(el => el.innerText.trim())
+              .filter(Boolean);
+            if (dropdownPhones.length > 1) {
+              result.AllPhones = dropdownPhones;
+            }
+          } else if (labelText.includes("fax")) {
+            result.Fax = mainValue?.innerText.trim() || null;
+          } else if (labelText.includes("e-mail")) {
+            result.Email = linkValue?.innerText.trim() || linkValue?.getAttribute("href")?.replace("mailto:", "") || null;
+          } else if (labelText.includes("site web")) {
+            result.SiteWeb = linkValue?.innerText.trim() || null;
+          }
+        });
+
+        // ── FALLBACK ADDRESS (keep existing fallbacks) ──
+        if (!result.Address) {
+          const addressBlocks = Array.from(document.querySelectorAll("div.row.ligne-tfmw"));
+          for (const block of addressBlocks) {
+            const b = block.querySelector("b");
+            const value = block.querySelector("label");
+            if (!b || !value) continue;
+            if (normalize(b.innerText).includes("adresse")) {
+              result.Address = value.innerText.trim();
+              break;
+            }
+          }
+        }
+
         if (!result.Address) {
           const labels = Array.from(document.querySelectorAll("label")).map((l) =>
             l.innerText.trim()
           );
-
           const maybe = labels.find((l) => l.match(/\d{3,}/));
           if (maybe) result.Address = maybe;
         }
 
-        // fallback 2
         if (!result.Address) {
-          const match = document.body.innerText.match(
-            /Adresse\s*[:\-]?\s*(.+)/i
-          );
-          if (match) {
-            result.Address = match[1].split("\n")[0].trim();
-          }
+          const match = document.body.innerText.match(/Adresse\s*[:\-]?\s*(.+)/i);
+          if (match) result.Address = match[1].split("\n")[0].trim();
         }
 
         return result;
@@ -1264,6 +1438,11 @@ function buildResultWorkbook(results) {
         "RC Tribunal": "",
         "Forme Juridique": "",
         Capital: "",
+        Activite: "",           // 🔥 NEW
+        Telephone: "",          // 🔥 NEW
+        Fax: "",                // 🔥 NEW
+        Email: "",              // 🔥 NEW
+        SiteWeb: "",            // 🔥 NEW
         Adresse: "",
         "Error / Message": r.error,
         "Response Time (ms)": r.responseTime || "",
@@ -1288,6 +1467,11 @@ function buildResultWorkbook(results) {
         "RC Tribunal": res.RCTribunal || "",
         "Forme Juridique": res.FormeJuridique || "",
         Capital: res.Capital || "",
+        Activite: res.Activite || "",           // 🔥 NEW
+        Telephone: res.Telephone || "",          // 🔥 NEW
+        Fax: res.Fax || "",                      // 🔥 NEW
+        Email: res.Email || "",                  // 🔥 NEW
+        SiteWeb: res.SiteWeb || "",              // 🔥 NEW
         Adresse: res.Address || res.Adresse || "",
         "Error / Message": "",
         "Response Time (ms)": r.responseTime || "",
@@ -1303,14 +1487,18 @@ function buildResultWorkbook(results) {
             rec.matchScore != null
               ? (rec.matchScore * 100).toFixed(1) + "%"
               : "",
-          ICE: rec.details?.ICE || "",
-          RC: rec.details?.RCNumber || "",
-          "RC Tribunal": rec.details?.RCTribunal || "",
-          "Forme Juridique": rec.details?.FormeJuridique || "",
-          Capital: rec.details?.Capital || "",
-          Adresse:
-            rec.details?.Adresse || rec.details?.adresse_complete || "",
-          "Error / Message": "",
+          ICE: rec.ICE || "",
+          RC: rec.RCNumber || "",
+          "RC Tribunal": rec.RCTribunal || "",
+          "Forme Juridique": rec.FormeJuridique || "",
+          Capital: rec.Capital || "",
+          Activite: rec.Activite || "",           // 🔥 NEW
+          Telephone: rec.Telephone || "",          // 🔥 NEW
+          Fax: rec.Fax || "",                      // 🔥 NEW
+          Email: rec.Email || "",                  // 🔥 NEW
+          SiteWeb: rec.SiteWeb || "",              // 🔥 NEW
+          Adresse: rec.Address || rec.Adresse || rec.details?.Adresse || "",
+          "Error / Message": rec.error || "",
           "Response Time (ms)": j === 0 ? r.responseTime || "" : "",
         });
       });
@@ -1326,6 +1514,11 @@ function buildResultWorkbook(results) {
         "RC Tribunal": "",
         "Forme Juridique": "",
         Capital: "",
+        Activite: "",           // 🔥 NEW
+        Telephone: "",          // 🔥 NEW
+        Fax: "",                // 🔥 NEW
+        Email: "",              // 🔥 NEW
+        SiteWeb: "",            // 🔥 NEW
         Adresse: "",
         "Error / Message": res.Message || "",
         "Response Time (ms)": r.responseTime || "",
@@ -1557,10 +1750,7 @@ app.post("/api/search", async (req, res) => {
   const { name, city, contextId } = req.body;
   const requestId = Math.random().toString(36).substring(2, 8);
 
-  LOG.info(
-    "API",
-    `[${requestId}] /api/search called: name="${name}", city="${city}", contextId=${contextId ? contextId.slice(0, 8) : "auto"}`
-  );
+  LOG.info("API", `[${requestId}] /api/search called: name="${name}", city="${city}", contextId=${contextId ? contextId.slice(0, 8) : "auto"}`);
 
   if (!name) {
     return res.status(400).json({
@@ -1572,17 +1762,18 @@ app.post("/api/search", async (req, res) => {
   const startTime = Date.now();
   let ctx = null;
   let acquiredHere = false;
+  let retryCount = 0;
+  const MAX_RETRIES = 1; // One retry with fresh context
 
-  try {
+  async function doSearch() {
     // ── CONTEXT ACQUIRE ─────────────────────────────
-    if (contextId && pool.contexts.has(contextId)) {
+    if (contextId && pool.contexts.has(contextId) && retryCount === 0) {
       ctx = pool.contexts.get(contextId);
 
       if (pool.available.has(contextId)) {
         pool.available.delete(contextId);
         acquiredHere = true;
       }
-
       LOG.info("API", `[${requestId}] Using sticky context ${ctx.id.slice(0, 8)}`);
     } else {
       ctx = await pool.acquireContext();
@@ -1599,19 +1790,51 @@ app.post("/api/search", async (req, res) => {
 
     const page = ctx.getPage();
 
-    // ── 🔥 MAIN CALL (with ctx) ─────────────────────
+    // ── MAIN CALL ─────────────────────
     const result = await performSearch(name, city, page, ctx);
-
     result.ResponseTime = Date.now() - startTime;
+    return result;
+  }
 
-    LOG.info(
-      "API",
-      `[${requestId}] Done: Status=${result.Status}, time=${result.ResponseTime}ms`
-    );
-
+  try {
+    let result = await doSearch();
+    
+    LOG.info("API", `[${requestId}] Done: Status=${result.Status}, time=${result.ResponseTime}ms`);
     res.json(result);
   } catch (error) {
     LOG.error("API", `[${requestId}] Error: ${error.message}`);
+    
+    // Check if context died and we haven't retried yet
+    const isContextDead = error.message?.includes("Target page, context or browser has been closed") ||
+                          error.message?.includes("Context not initialized") ||
+                          error.message?.includes("Page has been closed") ||
+                          !ctx?.browser;
+    
+    if (isContextDead && retryCount < MAX_RETRIES) {
+      retryCount++;
+      LOG.warn("API", `[${requestId}] Context died, retrying with fresh context (${retryCount}/${MAX_RETRIES})`);
+      
+      // Clean up dead context reference
+      if (ctx && pool.contexts.has(ctx.id)) {
+        pool.removeContext(ctx.id);
+      }
+      ctx = null;
+      acquiredHere = false;
+      
+      try {
+        const result = await doSearch();
+        LOG.info("API", `[${requestId}] Retry success: Status=${result.Status}, time=${result.ResponseTime}ms`);
+        return res.json(result);
+      } catch (retryError) {
+        LOG.error("API", `[${requestId}] Retry also failed: ${retryError.message}`);
+        return res.status(500).json({
+          InputRaisonSociale: name,
+          Status: "Error",
+          ErrorMessage: retryError.message,
+          ResponseTime: Date.now() - startTime,
+        });
+      }
+    }
 
     res.status(500).json({
       InputRaisonSociale: name,
@@ -1626,7 +1849,6 @@ app.post("/api/search", async (req, res) => {
     }
   }
 });
-
 app.post("/api/debug-search", async (req, res) => {
   const { name, city } = req.body;
   const requestId = Math.random().toString(36).substring(2, 8);
@@ -2065,6 +2287,127 @@ app.get("/api/bulk-jobs", (req, res) => {
     createdAt: job.createdAt,
   }));
   res.json({ jobs: jobList });
+});
+// ═══════════════════════════════════════════════════════════════
+// KILL CONTEXT — forcibly kill a browser for resilience testing
+// ═══════════════════════════════════════════════════════════════
+
+app.post("/api/kill-context", async (req, res) => {
+  const { contextId, method = "crash" } = req.body;
+  const requestId = Math.random().toString(36).substring(2, 8);
+
+  LOG.info("API", `[${requestId}] /api/kill-context called: target=${contextId?.slice(0, 8)}, method=${method}`);
+
+  if (!contextId) {
+    return res.status(400).json({
+      success: false,
+      error: "contextId is required",
+    });
+  }
+
+  const ctx = pool.contexts.get(contextId);
+  if (!ctx) {
+    return res.status(404).json({
+      success: false,
+      error: "Context not found",
+      // ✅ CORRECT — lowercase 'id'
+availableContexts: Array.from(pool.contexts.keys()).map(id => id.slice(0, 8)),
+    });
+  }
+
+  try {
+    const beforeStatus = ctx.getStatus();
+
+    switch (method) {
+      case "crash": {
+        // Abruptly kill the browser process — simulates OOM or segfault
+        LOG.warn("API", `[${requestId}] 💥 CRASHING browser process for ${contextId.slice(0, 8)}`);
+        if (ctx.browser && ctx.browser.process()) {
+          ctx.browser.process().kill("SIGKILL");
+        }
+        // Force null references so subsequent ops fail
+        ctx.browser = null;
+        ctx.context = null;
+        ctx.pages = [];
+        ctx.isLoggedIn = false;
+        ctx.status = "crashed";
+        ctx.error = "Killed via /api/kill-context (SIGKILL)";
+        break;
+      }
+
+      case "disconnect": {
+        // Graceful browser close — simulates network partition or graceful shutdown
+        LOG.warn("API", `[${requestId}] 🔌 Gracefully disconnecting ${contextId.slice(0, 8)}`);
+        if (ctx.browser) {
+          await ctx.browser.close().catch(() => {});
+        }
+        ctx.browser = null;
+        ctx.context = null;
+        ctx.pages = [];
+        ctx.isLoggedIn = false;
+        ctx.status = "disconnected";
+        ctx.error = "Killed via /api/kill-context (graceful disconnect)";
+        break;
+      }
+
+      case "hang": {
+        // Freeze all pages — simulates deadlock or infinite loop
+        LOG.warn("API", `[${requestId}] 🧊 FREEZING pages for ${contextId.slice(0, 8)}`);
+        for (const page of ctx.pages) {
+          // Override evaluate to never resolve
+          page.evaluate = () => new Promise(() => {});
+          page.goto = () => new Promise(() => {});
+          page.waitForSelector = () => new Promise(() => {});
+        }
+        ctx.status = "hung";
+        ctx.error = "Killed via /api/kill-context (hang/deadlock)";
+        break;
+      }
+
+      case "corrupt-session": {
+        // Wipe login state but keep browser alive — simulates expired cookie
+        LOG.warn("API", `[${requestId}] 🍪 Corrupting session for ${contextId.slice(0, 8)}`);
+        ctx.isLoggedIn = false;
+        ctx.lastLoginAttempt = null;
+        // Clear cookies to force re-login on next request
+        if (ctx.context) {
+          await ctx.context.clearCookies().catch(() => {});
+        }
+        ctx.status = "session-lost";
+        ctx.error = "Killed via /api/kill-context (corrupt session)";
+        break;
+      }
+
+      default:
+        return res.status(400).json({
+          success: false,
+          error: `Unknown kill method "${method}". Use: crash, disconnect, hang, corrupt-session`,
+        });
+    }
+
+    // Remove from available pool so it's not handed out again
+    pool.available.delete(contextId);
+
+    // Emit status change so WebSocket clients see it immediately
+    ctx.emit("statusChange", ctx.getStatus());
+    broadcastStatus({ killedContext: contextId.slice(0, 8), method });
+
+    res.json({
+      success: true,
+      message: `Context ${contextId.slice(0, 8)} killed via "${method}"`,
+      contextId,
+      method,
+      beforeStatus,
+      afterStatus: ctx.getStatus(),
+    });
+
+  } catch (err) {
+    LOG.error("API", `[${requestId}] Kill failed: ${err.message}`);
+    res.status(500).json({
+      success: false,
+      error: err.message,
+    });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
