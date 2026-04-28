@@ -8,8 +8,8 @@ export default {
   },
 
   auth: {
-    username: process.env.CHARIKA_USERNAME || 'H.QOTBI@matu.ma',
-    password: process.env.CHARIKA_PASSWORD || 'Houssam@2002'
+    username: process.env.CHARIKA_USERNAME || 'ice.api@matu.ma',
+    password: process.env.CHARIKA_PASSWORD || 'Matu2024..'
   },
 
   scraper: {
